@@ -5,7 +5,6 @@ and the IPCA Feature Layer on AGOL
 Author: Moez Labiadh
 
 """
-
 import warnings
 warnings.simplefilter(action='ignore')
 
@@ -20,6 +19,7 @@ from arcgis.features import FeatureLayer
 from datetime import datetime
 import timeit
 import time
+
 
 class AGOConnector:
     def __init__(self, host, username, password):
