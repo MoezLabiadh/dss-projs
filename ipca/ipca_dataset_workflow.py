@@ -10,14 +10,10 @@ import warnings
 warnings.simplefilter(action='ignore')
 
 import os
-import pandas as pd
-import numpy as np
-
-import arcpy
 import json
+import arcpy
+import pandas as pd
 from arcgis.gis import GIS
-from arcgis.features import FeatureLayer
-
 from datetime import datetime
 import timeit
 import time
@@ -59,7 +55,7 @@ class AGOConnector:
 class AGOSyncManager:
     def __init__(
         self, gis, master_fc, unique_id_field, last_modified_field, 
-        today_date, agol_item_id_ovr
+        today_date, agol_item_id_main, agol_item_id_cust
     ):
         """
         Initialize the AGOLDataManager instance 
@@ -69,8 +65,8 @@ class AGOSyncManager:
         self.unique_id_field = unique_id_field
         self.last_modified_field = last_modified_field
         self.today_date = today_date
-        #self.agol_item_id_review = agol_item_id_review
-        self.agol_item_id_ovr = agol_item_id_ovr
+        self.agol_item_id_main = agol_item_id_main
+        self.agol_item_id_cust = agol_item_id_cust
         self.agol_df = None
         self.local_df = None
 
@@ -80,7 +76,7 @@ class AGOSyncManager:
         Returns a dataframe containing the records of an AGOL feature layer 
         """
         # Connect to the feature layer
-        item = self.gis.content.get(self.agol_item_id_ovr)
+        item = self.gis.content.get(self.agol_item_id_main)
         agol_layer = item.layers[0] 
 
         agol_features = agol_layer.query(
@@ -94,6 +90,7 @@ class AGOSyncManager:
             **f.attributes,
             "geometry": f.geometry
         } for f in agol_features])
+
 
         # Convert date columns: interpret as UTC then convert to local time
         for col in self.agol_df.columns:
@@ -328,29 +325,33 @@ class AGOSyncManager:
             print(f"...- FEATURE_ID: {feature_id}")
 
 
-    def overwrite_feature_layer(self) -> None:
+    def update_agol_fields(self) -> None:
         """
-        Overwrites a feature layer on AGO.
+        Updates AGO_PUBLISH_YN and AGO_PUBLISH_DATE fields in the source feature class.
         """
-        print(f"..retrieving target layer with ID: {self.agol_item_id_ovr}")
-        item = self.gis.content.get(self.agol_item_id_ovr)
-        if not item:
-            raise ValueError(f"Feature layer with ID {self.agol_item_id_ovr} not found.")
-        
-        print(f"..found feature layer: {item.title}")
-        layer = item.layers[0]  
 
-        row_count = int(arcpy.GetCount_management(self.master_fc)[0])
-        print(f"...Source feature class contains {row_count} rows")
-
-        # Update AGO_PUBLISH_YN and AGO_PUBLISH_DATE in the source feature class
-        print("..updating source feature class fields...")
         with arcpy.da.UpdateCursor(self.master_fc, ["AGO_PUBLISH_YN", "AGO_PUBLISH_DATE"]) as cursor:
             for row in cursor:
                 if row[0] == "No":  
                     row[0] = "Yes" 
                     row[1] = self.today_date  
                     cursor.updateRow(row)
+
+
+    def overwrite_feature_layer(self, agol_item_id: str, where_clause: str) -> None:
+        """
+        Overwrites a feature layer on AGO.
+        """
+        print(f"..retrieving target layer with ID: {agol_item_id}")
+        item = self.gis.content.get(agol_item_id)
+        if not item:
+            raise ValueError(f"Feature layer with ID {agol_item_id} not found.")
+        
+        print(f"..found feature layer: {item.title}")
+        layer = item.layers[0]  
+
+        row_count = int(arcpy.GetCount_management(self.master_fc)[0])
+        print(f"...Source feature class contains {row_count} rows")
 
         # Process to update AGOL
         print("..truncating the feature layer...")
@@ -369,7 +370,7 @@ class AGOSyncManager:
         chunk_size = 5  # Set batch size to 5
 
         # Loop through rows in the feature class and convert them to the required format
-        with arcpy.da.SearchCursor(self.master_fc, ["SHAPE@"] + fields) as cursor:
+        with arcpy.da.SearchCursor(self.master_fc, ["SHAPE@"] + fields, where_clause) as cursor:
             for row in cursor:
                 geom = row[0]
                 if geom is None:
@@ -400,18 +401,22 @@ class AGOSyncManager:
 
 
 
-
-def backup_master_dataset(main_gdb, archive_gdb, source_fc_name) -> None:
+def copy_master_dataset(source_fc, target_gdb, target_fc_name, where_clause="") -> None:
     """
-    Makes a backup copy of the main IPCA dataset.
+    Makes a copy of the main IPCA featureclass based on a where_clause.
     """
-    source_fc = os.path.join(main_gdb, source_fc_name)
-    today_date = datetime.now().strftime("%Y%m%d")
-    backup_fc_name = f"IPCA_{today_date}"
-    destination_fc = os.path.join(archive_gdb, backup_fc_name)
+    destination_fc = os.path.join(target_gdb, target_fc_name)
 
-    arcpy.CopyFeatures_management(source_fc, destination_fc)
-    print("..backup successful!")
+    if arcpy.Exists(destination_fc):
+        arcpy.Delete_management(destination_fc)
+    
+    if where_clause:
+        arcpy.Select_analysis(source_fc, destination_fc, where_clause)
+    else:
+        arcpy.CopyFeatures_management(source_fc, destination_fc)
+    
+    print("..dataset copied successfully!")
+
 
 
 
@@ -419,25 +424,29 @@ def backup_master_dataset(main_gdb, archive_gdb, source_fc_name) -> None:
 if __name__ == "__main__":
     start_t = timeit.default_timer()
 
-    wks = r"\\spatialfiles.bcgov\work\ilmb\dss\dss_workarea\mlabiadh\workspace\20241126_IPCA\work\Master_Data"
+    wks = r"Q:\dss_workarea\mlabiadh\workspace\20241126_IPCA\work\Master_Data"
     main_gdb = os.path.join(wks, 'IPCA.gdb')
     archive_gdb = os.path.join(wks, 'archived data', 'IPCA_Archive.gdb')
 
     master_fc = os.path.join(main_gdb, 'IPCA_working')
 
     # Uncomment if backup is needed
-    '''
+ 
     print('Backing up the master IPCA dataset...')
-    backup_master_dataset(
-        main_gdb, 
-        archive_gdb,
-        master_fc
+    today_date_f = datetime.now().strftime("%Y%m%d")
+    backup_fc_name = f"IPCA_{today_date_f}"
+
+    copy_master_dataset(
+        master_fc, 
+        archive_gdb, 
+        backup_fc_name
     )
-    '''
+
     
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
+
         AGO_USERNAME_DSS = 'XXX'  # Replace with actual username
         AGO_PASSWORD_DSS = 'XXX' # Replace with actual password
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
@@ -447,8 +456,8 @@ if __name__ == "__main__":
         unique_id_field = 'FEATURE_ID'
         last_modified_field = 'LAST_MODIFIED_DATE'
         today_date = datetime.now()
-        #agol_item_id_review = '66190589c7fa484ab4d0ca8058702aaf'  # Replace with actual AGOL item ID
-        agol_item_id_ovr = '6796880dc5d449339c9f90af5d0e8884'  # Replace with actual AGOL item ID
+        agol_item_id_main = '6796880dc5d449339c9f90af5d0e8884'  
+        agol_item_id_cust = 'e829e7ba09ed4f119cfeef7ac6aa801e'  
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -456,8 +465,8 @@ if __name__ == "__main__":
             unique_id_field=unique_id_field,
             last_modified_field=last_modified_field,
             today_date=today_date,
-            #agol_item_id_review=agol_item_id_review,
-            agol_item_id_ovr=agol_item_id_ovr
+            agol_item_id_main=agol_item_id_main,
+            agol_item_id_cust=agol_item_id_cust
         )
 
         print('\nRetrieving AGO layer records..')
@@ -474,16 +483,33 @@ if __name__ == "__main__":
         print('\nAppending edited AGOL records to the Master dataset..')
         agol_sync_manager.append_edited_agol_records()
 
+        print("\nUpdating AGOL fields in the source Master dataset...")
+        agol_sync_manager.update_agol_fields()
+
         print('\nAppending new Master dataset records to AGOL ..')
         agol_sync_manager.append_new_local_records()
 
+        print('\nUpdating the AGO main layer...')
+        agol_sync_manager.overwrite_feature_layer(agol_item_id=agol_sync_manager.agol_item_id_main, 
+                                                  where_clause="1=1")
+        
+        print('\nUpdating the AGO custom layer...')
+        custom_clause = "PRIVACY_LEVEL IN ('Unrestricted', 'Internal only')"
+        agol_sync_manager.overwrite_feature_layer(agol_item_id=agol_sync_manager.agol_item_id_cust, 
+                                                  where_clause=custom_clause)
+        
 
-
-        print('\nUpdating the AGO layer...')
-        agol_sync_manager.overwrite_feature_layer()
+        print('\nUpdating the IPCA custom featureclass...')
+        copy_master_dataset(
+            master_fc, 
+            main_gdb, 
+            target_fc_name = 'IPCA_custom',
+            where_clause = custom_clause
+        )
 
     except Exception as e:
         print(f"Error occurred: {e}") 
+
 
     finally:
         ago.disconnect()
