@@ -5,6 +5,7 @@ and the IPCA Feature Layer on AGOL
 Author: Moez Labiadh
 
 """
+
 import warnings
 warnings.simplefilter(action='ignore')
 
@@ -13,13 +14,13 @@ import pandas as pd
 import numpy as np
 
 import arcpy
+import json
 from arcgis.gis import GIS
 from arcgis.features import FeatureLayer
 
 from datetime import datetime
 import timeit
 import time
-
 
 class AGOConnector:
     def __init__(self, host, username, password):
@@ -58,7 +59,7 @@ class AGOConnector:
 class AGOSyncManager:
     def __init__(
         self, gis, master_fc, unique_id_field, last_modified_field, 
-        today_date, agol_item_id_review, agol_item_id_ovr
+        today_date, agol_item_id_ovr
     ):
         """
         Initialize the AGOLDataManager instance 
@@ -68,7 +69,7 @@ class AGOSyncManager:
         self.unique_id_field = unique_id_field
         self.last_modified_field = last_modified_field
         self.today_date = today_date
-        self.agol_item_id_review = agol_item_id_review
+        #self.agol_item_id_review = agol_item_id_review
         self.agol_item_id_ovr = agol_item_id_ovr
         self.agol_df = None
         self.local_df = None
@@ -79,7 +80,7 @@ class AGOSyncManager:
         Returns a dataframe containing the records of an AGOL feature layer 
         """
         # Connect to the feature layer
-        item = self.gis.content.get(self.agol_item_id_review)
+        item = self.gis.content.get(self.agol_item_id_ovr)
         agol_layer = item.layers[0] 
 
         agol_features = agol_layer.query(
@@ -94,10 +95,12 @@ class AGOSyncManager:
             "geometry": f.geometry
         } for f in agol_features])
 
-        # Format datetime columns correctly
+        # Convert date columns: interpret as UTC then convert to local time
         for col in self.agol_df.columns:
             if 'date' in col.lower() and col != 'UPDATE_LOG':
-                self.agol_df[col] = pd.to_datetime(self.agol_df[col], unit='ms')
+                self.agol_df[col] = pd.to_datetime(
+                    self.agol_df[col], unit='ms', utc=True
+                ).dt.tz_convert('America/Vancouver').dt.tz_localize(None)
 
         return self.agol_df
 
@@ -122,7 +125,9 @@ class AGOSyncManager:
         Appends new records from AGOL to the master dataset
         """
         # New rows in AGOL
-        agol_new = self.agol_df[~self.agol_df[self.unique_id_field].isin(self.local_df[self.unique_id_field])]
+        agol_new = self.agol_df[
+            ~self.agol_df[self.unique_id_field].isin(self.local_df[self.unique_id_field])
+        ]
         agol_new = agol_new[agol_new["geometry"].notnull()]  # Remove null geometries
 
         # Define field mappings
@@ -187,7 +192,7 @@ class AGOSyncManager:
         # Edited Attributes in AGO - Step 1: search for modifications
         editCols = [
             'PROJECT_ID', 'FIRST_NATION_GROUP', 'PROJECT_NAME', 'PRIVACY_LEVEL',
-            'DATA_SOURCE', 'SPATIAL_ACCURACY', 'UPDATE_LOG', self.last_modified_field, 'EDITOR_NAME',
+            'DATA_SOURCE', 'SPATIAL_ACCURACY', 'LAST_MODIFIED_DATE', 'UPDATE_LOG', 'EDITOR_NAME'
         ]
 
         # Ensure the unique_id_field exists in both dataframes
@@ -217,6 +222,12 @@ class AGOSyncManager:
                         # Handle null/NaT comparison for date fields
                         if pd.isnull(agol_value) and pd.isnull(local_value):
                             continue  # Both are null, skip comparison
+
+                        '''       
+                        # if AGOL value is null and local value is not null, skip modification.
+                        if pd.isnull(agol_value) and not pd.isnull(local_value):
+                            continue
+                        ''' 
 
                         # Check if values differ
                         if agol_value != local_value:
@@ -360,14 +371,17 @@ class AGOSyncManager:
         # Loop through rows in the feature class and convert them to the required format
         with arcpy.da.SearchCursor(self.master_fc, ["SHAPE@"] + fields) as cursor:
             for row in cursor:
-                geom = row[0]  # SHAPE@ gives the geometry object
+                geom = row[0]
                 if geom is None:
                     continue  # Skip rows with no geometry
-                geom_json = geom.JSON  # Convert geometry to JSON format
+
+                # Convert the geometry JSON string to a dictionary
+                geom_json = json.loads(geom.JSON)
+
                 attributes = {fields[i]: row[i + 1] for i in range(len(fields))}
                 features.append({"geometry": geom_json, "attributes": attributes})
 
-        # Upload features in chunks of 5. to avoid large payload (Error 413: Max retries exceeded with url)
+        # Upload features in chunks of 5 to avoid large payload issues
         for i in range(0, len(features), chunk_size):
             chunk = features[i:i + chunk_size]
             
@@ -382,7 +396,8 @@ class AGOSyncManager:
             except Exception as e:
                 print(f"...error in batch {i//chunk_size + 1}: {e}")
 
-            time.sleep(2)  # 2 seconds Pause to avoid hitting API rate limits
+            time.sleep(2)  # Pause to avoid hitting API rate limits
+
 
 
 
@@ -404,7 +419,7 @@ def backup_master_dataset(main_gdb, archive_gdb, source_fc_name) -> None:
 if __name__ == "__main__":
     start_t = timeit.default_timer()
 
-    wks = r"Q:\dss_workarea\mlabiadh\workspace\20241126_IPCA\work\Master_Data"
+    wks = r"\\spatialfiles.bcgov\work\ilmb\dss\dss_workarea\mlabiadh\workspace\20241126_IPCA\work\Master_Data"
     main_gdb = os.path.join(wks, 'IPCA.gdb')
     archive_gdb = os.path.join(wks, 'archived data', 'IPCA_Archive.gdb')
 
@@ -415,7 +430,7 @@ if __name__ == "__main__":
     print('Backing up the master IPCA dataset...')
     backup_master_dataset(
         main_gdb, 
-        archive_gdb, 
+        archive_gdb,
         master_fc
     )
     '''
@@ -432,8 +447,8 @@ if __name__ == "__main__":
         unique_id_field = 'FEATURE_ID'
         last_modified_field = 'LAST_MODIFIED_DATE'
         today_date = datetime.now()
-        agol_item_id_review = '66190589c7fa484ab4d0ca8058702aaf'  # Replace with actual AGOL item ID
-        agol_item_id_ovr = '911c500c9f2c4076b307c34275d9bed0'  # Replace with actual AGOL item ID
+        #agol_item_id_review = '66190589c7fa484ab4d0ca8058702aaf'  # Replace with actual AGOL item ID
+        agol_item_id_ovr = '6796880dc5d449339c9f90af5d0e8884'  # Replace with actual AGOL item ID
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -441,7 +456,7 @@ if __name__ == "__main__":
             unique_id_field=unique_id_field,
             last_modified_field=last_modified_field,
             today_date=today_date,
-            agol_item_id_review=agol_item_id_review,
+            #agol_item_id_review=agol_item_id_review,
             agol_item_id_ovr=agol_item_id_ovr
         )
 
@@ -461,6 +476,8 @@ if __name__ == "__main__":
 
         print('\nAppending new Master dataset records to AGOL ..')
         agol_sync_manager.append_new_local_records()
+
+
 
         print('\nUpdating the AGO layer...')
         agol_sync_manager.overwrite_feature_layer()
