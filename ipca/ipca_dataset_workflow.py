@@ -182,6 +182,35 @@ class AGOSyncManager:
             print("..no new rows from AGOL to append.")
 
 
+    def delete_removed_agol_records(self) -> None:
+        """
+        Deletes records from the master feature class that are no longer present in the AGOL dataset.
+        """
+        # Identify records in the local dataset missing from AGOL
+        deleted_records = self.local_df[
+            ~self.local_df[self.unique_id_field].isin(self.agol_df[self.unique_id_field])
+        ]
+        
+        if deleted_records.empty:
+            print("..no records to delete from the Master dataset/featureclass.")
+            return
+
+        # Create a list of unique IDs that need deletion
+        ids_to_delete = deleted_records[self.unique_id_field].tolist()
+        print(f"..deleting {len(ids_to_delete)} rows from the Master dataset/featureclass.")
+        
+        deleted_count = 0
+        # Use an UpdateCursor to remove rows from the master feature class
+        with arcpy.da.UpdateCursor(self.master_fc, [self.unique_id_field]) as cursor:
+            for row in cursor:
+                if row[0] in ids_to_delete:
+                    cursor.deleteRow()
+                    deleted_count += 1
+                    print(f"...- DELETED FEATURE_ID: {row[0]}")
+
+        print(f"..successfully deleted {deleted_count} rows from the Master dataset/featureclass.")
+
+
     def append_edited_agol_records(self) -> None:
         """
         Appends edited records from AGOL to the master dataset
@@ -415,7 +444,7 @@ def copy_master_dataset(source_fc, target_gdb, target_fc_name, where_clause="") 
     else:
         arcpy.CopyFeatures_management(source_fc, destination_fc)
     
-    print("..dataset copied successfully!")
+    print("...dataset copied successfully!")
 
 
 
@@ -446,7 +475,6 @@ if __name__ == "__main__":
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
-
         AGO_USERNAME_DSS = 'XXX'  # Replace with actual username
         AGO_PASSWORD_DSS = 'XXX' # Replace with actual password
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
@@ -456,8 +484,8 @@ if __name__ == "__main__":
         unique_id_field = 'FEATURE_ID'
         last_modified_field = 'LAST_MODIFIED_DATE'
         today_date = datetime.now()
-        agol_item_id_main = '6796880dc5d449339c9f90af5d0e8884'  
-        agol_item_id_cust = 'e829e7ba09ed4f119cfeef7ac6aa801e'  
+        agol_item_id_main = 'f0a0805b69ec494c8634892b7ed24dc0'  
+        agol_item_id_cust = 'f9d25b0639fb41c1a798386ee26b19c4'  
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -479,6 +507,9 @@ if __name__ == "__main__":
 
         print('\nAppending new AGOL records to the Master dataset..')
         agol_sync_manager.append_new_agol_records()
+
+        print('\nRemoving deleted AGOL records from the Master dataset..')
+        agol_sync_manager.delete_removed_agol_records()
 
         print('\nAppending edited AGOL records to the Master dataset..')
         agol_sync_manager.append_edited_agol_records()
