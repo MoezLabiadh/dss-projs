@@ -257,15 +257,17 @@ class AGOSyncManager:
 
                         # Check if values differ
                         if agol_value != local_value:
-                            # Check LAST_MODIFIED_DATE condition
+                            # Retrieve AGOL modified date; if null, fallback to 'EditDate'
                             agol_modified_date = row.get(self.last_modified_field)
+                            if pd.isnull(agol_modified_date):
+                                agol_modified_date = row.get('EditDate')
+                                
                             local_modified_date = local_dict[row_id].get(self.last_modified_field)
 
-                            # Consider edited if LAST_MODIFIED_DATE in agol_df is greater or either is null
-                            if (pd.isnull(agol_modified_date) or pd.isnull(local_modified_date)) or (
-                                not pd.isnull(agol_modified_date) and not pd.isnull(local_modified_date) and 
-                                agol_modified_date > local_modified_date
-                            ):
+                            # If local_modified_date is null, 
+                            # or if a valid AGOL date exists and is greater than or equal to local_modified_date, mark as edited.
+                            if pd.isnull(local_modified_date) or \
+                                        (pd.notnull(agol_modified_date) and agol_modified_date >= local_modified_date):
                                 edited_rows.append(row_id)
                                 modifications.append({
                                     "FEATURE_ID": row_id,
@@ -475,8 +477,9 @@ if __name__ == "__main__":
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
-        AGO_USERNAME_DSS = 'XXX'  # Replace with actual username
-        AGO_PASSWORD_DSS = 'XXX' # Replace with actual password
+
+        AGO_USERNAME_DSS = 'XXX' 
+        AGO_PASSWORD_DSS = 'XXX' 
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
         gis = ago.connect()
 
