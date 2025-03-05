@@ -1,9 +1,18 @@
 """
-This script synchronizes records between the local IPCA dataset (gdb/featureclass) 
-and the IPCA Feature Layer on AGOL
+This script synchronizes records between the local IPCA master dataset (gdb/featureclass) 
+and the IPCA Feature Layer on AGOL.
 
-Author: Moez Labiadh
+The script executes the following workflow:
+    - Create a backup copy of the master IPCA dataset in the Archive gdb
+    - Check for new records in the AGOL Feature Layer and appends them to the master dataset
+    - Check for deleted records in the AGOL Feature Layer and remove them them to the master dataset
+    - Check for updated records (attributes only) in the AGOL Feature Layer and modify them to the master dataset
+    - Overwrites the AGOL Feature Layer with records from the master dataset.
+    - Updates the custom IPCA dataset and AGOL Feature Layer ('Unrestricted' and 'Internal only' records)
 
+
+Created on: 2025-03-03
+By: Moez Labiadh
 """
 
 import warnings
@@ -455,11 +464,11 @@ def copy_master_dataset(source_fc, target_gdb, target_fc_name, where_clause="") 
 if __name__ == "__main__":
     start_t = timeit.default_timer()
 
-    wks = r"Q:\dss_workarea\mlabiadh\workspace\20241126_IPCA\work\Master_Data"
+    wks = r"Q:\projects\Mwlrs\Land Use Planning\Master_Data"
     main_gdb = os.path.join(wks, 'IPCA.gdb')
     archive_gdb = os.path.join(wks, 'archived data', 'IPCA_Archive.gdb')
 
-    master_fc = os.path.join(main_gdb, 'IPCA_working')
+    master_fc = os.path.join(main_gdb, 'IPCA')
 
     # Uncomment if backup is needed
  
@@ -473,13 +482,11 @@ if __name__ == "__main__":
         backup_fc_name
     )
 
-    
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
-
-        AGO_USERNAME_DSS = 'XXX' 
-        AGO_PASSWORD_DSS = 'XXX' 
+        AGO_USERNAME_DSS = os.getenv('AGO_USERNAME_DSS')
+        AGO_PASSWORD_DSS = os.getenv('AGO_PASSWORD_DSS')
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
         gis = ago.connect()
 
@@ -487,8 +494,8 @@ if __name__ == "__main__":
         unique_id_field = 'FEATURE_ID'
         last_modified_field = 'LAST_MODIFIED_DATE'
         today_date = datetime.now()
-        agol_item_id_main = 'f0a0805b69ec494c8634892b7ed24dc0'  
-        agol_item_id_cust = 'f9d25b0639fb41c1a798386ee26b19c4'  
+        agol_item_id_main = '4127c4fc28774bfa87dccbcd7bfb145b'  
+        agol_item_id_cust = '4e417b4b55f74d8e87cc106b1fe5328d'  
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -532,7 +539,6 @@ if __name__ == "__main__":
         agol_sync_manager.overwrite_feature_layer(agol_item_id=agol_sync_manager.agol_item_id_cust, 
                                                   where_clause=custom_clause)
         
-
         print('\nUpdating the IPCA custom featureclass...')
         copy_master_dataset(
             master_fc, 
