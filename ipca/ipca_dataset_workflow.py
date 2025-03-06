@@ -3,12 +3,12 @@ This script synchronizes records between the local IPCA master dataset (gdb/feat
 and the IPCA Feature Layer on AGOL.
 
 The script executes the following workflow:
-    - Create a backup copy of the master IPCA dataset in the Archive gdb
-    - Check for new records in the AGOL Feature Layer and appends them to the master dataset
-    - Check for deleted records in the AGOL Feature Layer and remove them them to the master dataset
-    - Check for updated records (attributes only) in the AGOL Feature Layer and modify them to the master dataset
-    - Overwrites the AGOL Feature Layer with records from the master dataset.
-    - Updates the custom IPCA dataset and AGOL Feature Layer ('Unrestricted' and 'Internal only' records)
+    1) Create a backup copy of the master IPCA dataset in the Archive gdb
+    2) Check for new records in the AGOL Feature Layer and appends them to the master dataset
+    3) Check for deleted records in the AGOL Feature Layer and remove  from the master dataset
+    4) Check for updated records (attributes only) in the AGOL Feature Layer and modify them in the master dataset
+    5) Overwrites the AGOL Feature Layer with records from the master dataset.
+    6) Updates the custom IPCA dataset and AGOL Feature Layer ('Unrestricted' and 'Internal only' records)
 
 
 Created on: 2025-03-03
