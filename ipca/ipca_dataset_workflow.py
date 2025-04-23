@@ -552,8 +552,8 @@ if __name__ == "__main__":
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
-        AGO_USERNAME_DSS = 'PX.GeoBC.DSS.Creator' 
-        AGO_PASSWORD_DSS = 'maps_are_gr8!' 
+        AGO_USERNAME_DSS = 'XXX' 
+        AGO_PASSWORD_DSS = 'XXX' 
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
         gis = ago.connect()
 
