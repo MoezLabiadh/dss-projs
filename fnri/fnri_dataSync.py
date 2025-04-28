@@ -7,8 +7,8 @@ The script executes the following workflow:
     2) Detect modified attributes in AGOL and edit them in the working GDB
     3) Flag records that are marked Complete (FNLT and MIRR) 
        but have null values in any of the required attribute columns.
-    4) Move records marked 'Ready To Publish' from the working gdb into the staging gdb
-    
+    4) Copy records marked 'Ready To Publish' from the working gdb into the staging gdb
+       Copied ready-to-publish records overlapping with existing records in staging are flagged 
 
 
 Created on: 2025-04-23
@@ -81,7 +81,8 @@ class AGOSyncManager:
             "append_new_areas_to_agol": [],
             "modify_edited_agol_attributes": [],
             "flag_missing_attributes": [],
-            "move_published_to_staging": []
+            "move_published_to_staging": [],
+            "flag_spatial_overlaps_staging": []
 
         }
 
@@ -175,71 +176,72 @@ class AGOSyncManager:
 
 
     def modify_edited_agol_attributes(self) -> None:
-        """
-        Detect modified attributes in AGOL and edit them in the working dataset.
-        (Logs: Records modified in AGOL)
-        """
-        edit_fields = [
-            'FIRST_NATION', 'AGREEMENT_TYPE', 'AGREEMENT_STAGE',
-            'AGREEMENT_LINK', 'CONTACT_NAME', 'CONTACT_EMAIL', 'DATE_CREATED',
-            'Review_Status_FNLT', 'Review_Status_MIRR', 'Publish_Status'
-        ]
+            """
+            Detect modified attributes in AGOL and edit them in the working dataset.
+            (Logs: Records modified in AGOL)
+            """
+            edit_fields = [
+                'FIRST_NATION', 'AGREEMENT_TYPE', 'AGREEMENT_STAGE',
+                'AGREEMENT_LINK', 'CONTACT_NAME', 'CONTACT_EMAIL', 'DATE_CREATED',
+                'Review_Status_FNLT', 'Review_Status_MIRR', 'Publish_Status'
+            ]
+            uid = self.unique_id_field
 
-        uid = self.unique_id_field
+            # build a lookup of local records
+            local_lookup = (
+                self.local_df
+                    .drop(columns=['SHAPE'], errors='ignore')
+                    .set_index(uid)[edit_fields]
+                    .to_dict(orient='index')
+            )
 
-        # build a lookup of local records
-        local_lookup = (
-            self.local_df
-                .drop(columns=['SHAPE'], errors='ignore')
-                .set_index(uid)[edit_fields]
-                .to_dict(orient='index')
-        )
+            # index AGOL by uid and focus on our edit fields
+            agol_indexed = self.agol_df.set_index(uid)
+            agol_to_check = agol_indexed[edit_fields]
 
-        # index AGOL by uid and focus on our edit fields
-        agol_indexed = self.agol_df.set_index(uid)
-        agol_to_check = agol_indexed[edit_fields]
-
-        modified_ids = []
-        for record_id, agol_row in agol_to_check.iterrows():
-            local_row = local_lookup.get(record_id)
-            if not local_row:
-                continue
-            for field in edit_fields:
-                a = agol_row[field]
-                l = local_row[field]
-                if pd.isna(a) and pd.isna(l):
+            modified_ids = []
+            for record_id, agol_row in agol_to_check.iterrows():
+                local_row = local_lookup.get(record_id)
+                if not local_row:
                     continue
-                if a != l:
-                    modified_ids.append(record_id)
-                    break
+                for field in edit_fields:
+                    a = agol_row[field]
+                    l = local_row[field]
+                    if pd.isna(a) and pd.isna(l):
+                        continue
+                    if a != l:
+                        modified_ids.append(record_id)
+                        break
 
-        if not modified_ids:
-            print("..no edits detected in AGOL.")
-            return
+            if not modified_ids:
+                print("..no edits detected in AGOL.")
+                return
 
-        unique_ids = set(modified_ids)
-        print(f"..found {len(unique_ids)} records with modified attributes in AGOL: {modified_ids}.")
+            unique_ids = set(modified_ids)
+            print(f"..found {len(unique_ids)} records with modified attributes in AGOL: {modified_ids}.")
 
-        # ensure change_log key exists
-        self.change_log.setdefault("modify_edited_agol_attributes", [])
+            self.change_log.setdefault("modify_edited_agol_attributes", [])
 
-        # apply updates back to the master feature class
-        fields = [uid] + edit_fields
-        with arcpy.da.UpdateCursor(self.working_fc, fields) as cursor:
-            for row in cursor:
-                fid = row[0]
-                if fid in unique_ids:
-                    updated = False
-                    for idx, field in enumerate(edit_fields, start=1):
-                        new_val = agol_indexed.at[fid, field]
-                        if row[idx] != new_val:
-                            row[idx] = new_val
-                            updated = True
-                    if updated:
-                        cursor.updateRow(row)
+            # apply updates back to the master feature class
+            fields = [uid] + edit_fields
+            # explicit=True ensures that None becomes a true NULL in the FGDB
+            with arcpy.da.UpdateCursor(self.working_fc, fields, explicit=True) as cursor:
+                for row in cursor:
+                    fid = row[0]
+                    if fid in unique_ids:
+                        updated = False
+                        for idx, field in enumerate(edit_fields, start=1):
+                            new_val = agol_indexed.at[fid, field]
+                            # if the AGOL value is NaT (datetime) or NaN, convert to None
+                            if pd.isna(new_val):
+                                new_val = None
+                            if row[idx] != new_val:
+                                row[idx] = new_val
+                                updated = True
+                        if updated:
+                            cursor.updateRow(row)
 
-        # log which IDs were updated
-        self.change_log["modify_edited_agol_attributes"].extend(unique_ids)
+            self.change_log["modify_edited_agol_attributes"].extend(unique_ids)
 
 
 
@@ -247,7 +249,7 @@ class AGOSyncManager:
         """
         Flags Parcel_Name(s) that are marked Complete (FNLT or MIRR)
         but have null values in any of the required attribute columns.
-        (Logs: [FLAGGED!] -  Ready-to-Publish Records with missing Attributes)
+        (Logs: [QC/QA!] -  Ready-to-Publish Records with missing Attributes)
         """
         required = [
             'FIRST_NATION', 'AGREEMENT_TYPE', 'AGREEMENT_STAGE',
@@ -274,8 +276,10 @@ class AGOSyncManager:
         """
         Move records marked Ready To Publish from working_fc into staging_fc.
         If a record already exists in staging_fc (same unique_id), delete it
-        before inserting the up-to-date copy from working_fc.
-        (Logs: Ready-to-Publish Records moved to staging dataset).
+        before inserting the up-to-date copy from working_fc. Then flag any
+        moved records whose geometries overlap existing staging features.
+        (Logs: Ready-to-Publish Records moved to staging dataset;
+               [QC/QA!] - Records overlapping in staging)
         """
         df = self.local_df
         mask = (
@@ -283,22 +287,17 @@ class AGOSyncManager:
             (df['Review_Status_MIRR'] == 'Complete') &
             (df['Publish_Status']     == 'Ready to Publish')
         )
-
         to_move = df.loc[mask]
-
         if to_move.empty:
             print("..no records ready to publish to staging.")
             return
 
-        # ensure log key exists
         self.change_log.setdefault("move_published_to_staging", [])
 
-        # get existing staging IDs
+        # 1) Delete duplicates in staging
         staging_df   = pd.DataFrame.spatial.from_featureclass(self.staging_fc)
         existing_ids = set(staging_df[self.unique_id_field])
         ids_to_move  = set(to_move[self.unique_id_field])
-
-        # delete duplicates in staging
         dup_ids = existing_ids & ids_to_move
         if dup_ids:
             clause = f"{self.unique_id_field} IN ({','.join(repr(i) for i in dup_ids)})"
@@ -307,7 +306,7 @@ class AGOSyncManager:
                     cursor.deleteRow()
             print(f"..removed {len(dup_ids)} existing records from staging: {sorted(dup_ids)}")
 
-        # insert fresh copies
+        # 2) Insert fresh copies
         attr_fields = [c for c in to_move.columns if c != 'SHAPE']
         fields      = attr_fields + ['SHAPE@JSON']
         with arcpy.da.InsertCursor(self.staging_fc, fields) as inserter:
@@ -316,10 +315,40 @@ class AGOSyncManager:
                 geom  = json.dumps(row['SHAPE'])
                 inserter.insertRow(attrs + [geom])
 
-        # log moved IDs
+        # Log moved IDs
         moved_ids = sorted(ids_to_move)
         self.change_log["move_published_to_staging"].extend(moved_ids)
         print(f"..moved {len(moved_ids)} records to staging: {moved_ids}")
+
+        # 3) Spatial overlap check
+        if arcpy.Exists("staging_lyr"):
+            arcpy.Delete_management("staging_lyr")
+        arcpy.management.MakeFeatureLayer(self.staging_fc, "staging_lyr")
+
+        # Read geometries of just-moved records
+        geom_lookup = {}
+        with arcpy.da.SearchCursor(self.staging_fc, [self.unique_id_field, 'SHAPE@']) as cursor:
+            for uid, geometry in cursor:
+                if uid in ids_to_move:
+                    geom_lookup[uid] = geometry
+
+        overlap_ids = []
+        for uid, geom in geom_lookup.items():
+            # ensure we don’t re-use an old layer name
+            if arcpy.Exists("others_lyr"):
+                arcpy.Delete_management("others_lyr")
+            where_clause = f"{self.unique_id_field} <> '{uid}'"
+            arcpy.management.MakeFeatureLayer(self.staging_fc, "others_lyr", where_clause)
+
+            arcpy.management.SelectLayerByLocation("others_lyr", "INTERSECT", geom)
+            count = int(arcpy.management.GetCount("others_lyr")[0])
+            if count > 0:
+                overlap_ids.append(uid)
+
+        if overlap_ids:
+            self.change_log.setdefault("flag_spatial_overlaps_staging", []).extend(sorted(overlap_ids))
+            print(f"..records overlapping in staging: {sorted(overlap_ids)}")
+
 
 
     def export_change_log(self, log_file_path: str) -> None:
@@ -329,8 +358,9 @@ class AGOSyncManager:
         header_mapping = {
             "append_new_areas_to_agol"     : "New Areas added to AGOL:",
             "modify_edited_agol_attributes": "Records modified in AGOL:",
-            "flag_missing_attributes"      : "[FLAGGED!] -  Ready-to-Publish Records with missing Attributes:",
-            "move_published_to_staging"    : "Ready-to-Publish Records moved to staging dataset:"
+            "flag_missing_attributes"      : "[QC/QA!] -  Ready-to-Publish Records with missing Attributes:",
+            "move_published_to_staging"    : "Ready-to-Publish Records moved to staging dataset:",
+            "flag_spatial_overlaps_staging": "[QC/QA!] -Records overlapping in staging"
 
         }
         try:
