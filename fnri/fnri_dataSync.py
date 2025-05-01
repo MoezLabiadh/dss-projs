@@ -3,12 +3,14 @@ This script synchronizes records between the local FNRI working and
 staging datasets (gdb/featureclass) and the FNRI Feature Layer on AGOL.
 
 The script executes the following workflow:
+    0) Create a backup copy of the working and staging featureclasses
     1) Detect new Areas from the working GDB and append them to the AGOL Feature Layer
     2) Detect modified attributes in AGOL and edit them in the working GDB
     3) Flag records that are marked Complete (FNLT and MIRR) 
        but have null values in any of the required attribute columns.
-    4) Copy records marked 'Ready To Publish' from the working gdb into the staging gdb
-       Copied ready-to-publish records overlapping with existing records in staging are flagged 
+    4) Move records marked 'Ready To Publish' from the working gdb into the staging gdb
+       Moved records overlapping with existing records in staging are flagged in the log file 
+    5) Removed deleted records (published and manually deleted from working) from the AGOL Feature Layer
 
 
 Created on: 2025-04-23
@@ -82,7 +84,8 @@ class AGOSyncManager:
             "modify_edited_agol_attributes": [],
             "flag_missing_attributes": [],
             "move_published_to_staging": [],
-            "flag_spatial_overlaps_staging": []
+            "flag_spatial_overlaps_staging": [],
+            "delete_removed_records_from_agol": []
 
         }
 
@@ -314,13 +317,19 @@ class AGOSyncManager:
                 attrs = [row[f] if pd.notna(row[f]) else None for f in attr_fields]
                 geom  = json.dumps(row['SHAPE'])
                 inserter.insertRow(attrs + [geom])
+        
+        # 3) Delete moved records from working_fc
+        delete_clause = f"{self.unique_id_field} IN ({','.join(repr(i) for i in ids_to_move)})"
+        with arcpy.da.UpdateCursor(self.working_fc, [self.unique_id_field], delete_clause) as cursor:
+            for _ in cursor:
+                cursor.deleteRow()
 
         # Log moved IDs
         moved_ids = sorted(ids_to_move)
         self.change_log["move_published_to_staging"].extend(moved_ids)
         print(f"..moved {len(moved_ids)} records to staging: {moved_ids}")
 
-        # 3) Spatial overlap check
+        # 4) Spatial overlap check
         if arcpy.Exists("staging_lyr"):
             arcpy.Delete_management("staging_lyr")
         arcpy.management.MakeFeatureLayer(self.staging_fc, "staging_lyr")
@@ -350,17 +359,48 @@ class AGOSyncManager:
             print(f"..records overlapping in staging: {sorted(overlap_ids)}")
 
 
+    def delete_removed_local_records_from_agol(self) -> None:
+        """
+        Deletes records from the working AGO feature layer that are no longer present 
+        in the working local dataset.
+        (Logs: Records removed in AGOL)
+        """
+        agol_deleted = self.agol_df[
+            ~self.agol_df[self.unique_id_field].isin(self.local_df[self.unique_id_field])
+        ]
+        if not agol_deleted.empty:
+            unique_ids = agol_deleted[self.unique_id_field].tolist()
+            self.change_log["delete_removed_records_from_agol"].extend(unique_ids)
+            print(f"..deleted {len(unique_ids)} records from AGOL : {unique_ids}")
+
+            item = self.gis.content.get(self.agol_item_id_main)
+            layer = item.layers[0]
+
+            def format_id(val):
+                return f"'{val}'" if isinstance(val, str) else str(val)
+            ids_str = ", ".join(format_id(val) for val in unique_ids)
+            where_clause = f"{self.unique_id_field} in ({ids_str})"
+            result = layer.delete_features(where=where_clause)
+            if result.get("deleteResults"):
+                if not all(r.get("success") for r in result["deleteResults"]):
+                    print("..failed to delete some records from AGO.")
+            else:
+                print("..failed to delete records from AGO.")
+        else:
+            print("..no records in AGO were removed (delete_removed_local_records_from_agol).")
+
 
     def export_change_log(self, log_file_path: str) -> None:
         """
         Exports the collected change log information to a text file.
         """
         header_mapping = {
-            "append_new_areas_to_agol"     : "New Areas added to AGOL:",
-            "modify_edited_agol_attributes": "Records modified in AGOL:",
-            "flag_missing_attributes"      : "[QC/QA!] -  Ready-to-Publish Records with missing Attributes:",
-            "move_published_to_staging"    : "Ready-to-Publish Records moved to staging dataset:",
-            "flag_spatial_overlaps_staging": "[QC/QA!] -Records overlapping in staging"
+            "append_new_areas_to_agol"        : "New Areas added to AGOL:",
+            "modify_edited_agol_attributes"   : "Records modified in AGOL:",
+            "flag_missing_attributes"         : "[QC/QA!] -  Ready-to-Publish Records with missing Attributes:",
+            "move_published_to_staging"       : "Ready-to-Publish Records moved to staging dataset:",
+            "flag_spatial_overlaps_staging"   : "[QC/QA!] -Records overlapping in staging",
+            "delete_removed_records_from_agol": "Records removed in AGOL"
 
         }
         try:
@@ -385,16 +425,47 @@ class AGOSyncManager:
             print(f"..failed to export change log: {e}")
 
 
+
+def copy_featureclass(source_fc, target_gdb, target_fc_name, where_clause="") -> None:
+    """
+    Makes a copy of a featureclass based on a where_clause.
+    """
+    destination_fc = os.path.join(target_gdb, target_fc_name)
+    if arcpy.Exists(destination_fc):
+        arcpy.Delete_management(destination_fc)
+    if where_clause:
+        arcpy.Select_analysis(source_fc, destination_fc, where_clause)
+    else:
+        arcpy.CopyFeatures_management(source_fc, destination_fc)
+    print("...dataset copied successfully!")
+
+
+
 if __name__ == "__main__":
     start_t = timeit.default_timer()
 
     wks = r"Q:\dss_workarea\shbeatti\for_Chloe"
     main_gdb = os.path.join(wks, 'Sample_FNRI_working.gdb')
-    #archive_gdb = os.path.join(wks, 'Sample_FNRI_backup.gdb')
+    archive_gdb = os.path.join(wks, 'Sample_FNRI_backup.gdb')
     working_fc = os.path.join(main_gdb, 'Sample_FNRI_working_testScript')
     staging_fc = os.path.join(main_gdb, 'Sample_FNRI_staging_testScript')
 
-  
+    print('Backing up the working and staging datasets...')
+    today_date_f = datetime.now().strftime("%Y%m%d")
+
+    backup_fc_name = f"FNRI_working_{today_date_f}"
+    copy_featureclass(
+        working_fc, 
+        archive_gdb, 
+        backup_fc_name
+    )  
+
+    backup_fc_name = f"FNRI_staging_{today_date_f}"
+    copy_featureclass(
+        staging_fc, 
+        archive_gdb, 
+        backup_fc_name
+    )  
 
     try:
         print('\nLogging to AGO...')
@@ -446,7 +517,10 @@ if __name__ == "__main__":
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.move_published_to_staging()
 
-        
+        print('\nDelete removed records from AGOL…')
+        agol_sync_manager.get_local_data() # re-read local records
+        agol_sync_manager.get_agol_data()  # re-read agol records
+        agol_sync_manager.delete_removed_local_records_from_agol()        
 
 
         print('\nExporting the change log…')
