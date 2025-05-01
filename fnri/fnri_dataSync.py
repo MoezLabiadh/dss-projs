@@ -9,7 +9,7 @@ The script executes the following workflow:
     3) Flag records that are marked Complete (FNLT and MIRR) 
        but have null values in any of the required attribute columns.
     4) Move records marked 'Ready To Publish' from the working gdb into the staging gdb
-       Moved records overlapping with existing records in staging are flagged in the log file 
+       Flag moved records overlapping with existing records in staging 
     5) Removed deleted records (published and manually deleted from working) from the AGOL Feature Layer
 
 
@@ -343,10 +343,9 @@ class AGOSyncManager:
 
         overlap_ids = []
         for uid, geom in geom_lookup.items():
-            # ensure we don’t re-use an old layer name
             if arcpy.Exists("others_lyr"):
                 arcpy.Delete_management("others_lyr")
-            where_clause = f"{self.unique_id_field} <> '{uid}'"
+            where_clause = f"{self.unique_id_field} <> {uid}"
             arcpy.management.MakeFeatureLayer(self.staging_fc, "others_lyr", where_clause)
 
             arcpy.management.SelectLayerByLocation("others_lyr", "INTERSECT", geom)
@@ -356,7 +355,7 @@ class AGOSyncManager:
 
         if overlap_ids:
             self.change_log.setdefault("flag_spatial_overlaps_staging", []).extend(sorted(overlap_ids))
-            print(f"..records overlapping in staging: {sorted(overlap_ids)}")
+            print(f"..flagged records overlapping in staging: {sorted(overlap_ids)}")
 
 
     def delete_removed_local_records_from_agol(self) -> None:
@@ -447,8 +446,9 @@ if __name__ == "__main__":
     wks = r"Q:\dss_workarea\shbeatti\for_Chloe"
     main_gdb = os.path.join(wks, 'Sample_FNRI_working.gdb')
     archive_gdb = os.path.join(wks, 'Sample_FNRI_backup.gdb')
-    working_fc = os.path.join(main_gdb, 'Sample_FNRI_working_testScript')
-    staging_fc = os.path.join(main_gdb, 'Sample_FNRI_staging_testScript')
+    working_fc = os.path.join(main_gdb, 'Sample_FNRI_working_testScript_v2')
+    staging_fc = os.path.join(main_gdb, 'Sample_FNRI_staging_testScript_v2')
+
 
     print('Backing up the working and staging datasets...')
     today_date_f = datetime.now().strftime("%Y%m%d")
@@ -466,7 +466,7 @@ if __name__ == "__main__":
         archive_gdb, 
         backup_fc_name
     )  
-
+ 
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
@@ -475,11 +475,11 @@ if __name__ == "__main__":
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
         gis = ago.connect()
 
-        unique_id_field = 'Parcel_Name'  ###################### TBD ######################
+        unique_id_field = 'Poly_Unique_ID'  ###################### TBD ######################
 
         today_date = datetime.now()
 
-        agol_item_id_main = '9b7773e0897e45efa1d52b2aa28e9dab'  
+        agol_item_id_main = '8e871ec48e1f40d18ffeed647e1ec1e2'  
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
