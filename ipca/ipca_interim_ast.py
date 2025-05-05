@@ -1,3 +1,6 @@
+"""
+This script produces an Interim IPCA dataset for the AST tool 
+"""
 
 import warnings
 warnings.simplefilter(action='ignore')
@@ -43,8 +46,6 @@ def show_boundaries(df_ruls, gdf_ipca) -> gpd.GeoDataFrame:
     return gdf_bndr
 
 
-
-
 def cnslt_boundaries(df_ruls, gdf_pip) -> gpd.GeoDataFrame:
     """
     Returns a gdf of IPCA features whose geometries will be replaced with Consultation Boundaries
@@ -65,11 +66,35 @@ def cnslt_boundaries(df_ruls, gdf_pip) -> gpd.GeoDataFrame:
         on='CNSLTN_AREA_NAME'
     )
 
-    print (f'..Show boudaries has {len(gdf_cnslt)} features')
+    print (f'..Cnslt boudaries has {len(gdf_cnslt)} features')
 
     return gdf_cnslt
 
 
+def produce_interim (gdf_bndr, gdf_cnslt) -> gpd.GeoDataFrame:
+    """
+    Returns a gdf of of interim IPCA dataset
+    """
+    gdf_intr = gpd.GeoDataFrame(
+        pd.concat([gdf_bndr, gdf_cnslt], ignore_index=True),
+        crs=gdf_bndr.crs
+    )
+
+    gdf_intr.drop(
+        columns=['CNSLTN_AREA_NAME'], 
+        inplace=True
+    )
+
+    gdf_intr.sort_values(
+        by='FEATURE_ID',     
+        ascending=True, 
+        inplace=True,       
+        ignore_index=True     
+    )   
+
+    print (f'..IPCA interim dataset has {len(gdf_intr)} features')
+
+    return gdf_intr
 
 
 
@@ -95,6 +120,15 @@ if __name__ == "__main__":
 
     print("\nCreating a 'Consultation Boundaries' dataset...")
     gdf_cnslt = cnslt_boundaries(df_ruls, gdf_pip) 
+
+    print("\nProducing the IPCA Interim dataset...")
+    gdf_intr = produce_interim (gdf_bndr, gdf_cnslt)
+
+    gdf_intr.to_file(
+        filename=intr_gdb,    
+        driver="OpenFileGDB",                 
+        layer="interim_IPCA"    
+    )
 
 
 
