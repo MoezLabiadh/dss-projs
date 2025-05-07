@@ -3,14 +3,15 @@ This script synchronizes records between the local FNRI working and
 staging datasets (gdb/featureclass) and the FNRI Feature Layer on AGOL.
 
 The script executes the following workflow:
-    0) Create a backup copy of the working and staging featureclasses
-    1) Detect new Areas from the working GDB and append them to the AGOL Feature Layer
-    2) Detect modified attributes in AGOL and edit them in the working GDB
+    0) Create a backup copy of the Working and Staging featureclasses
+    1) Detect new Areas from the Working GDB and append them to the Working AGOL Feature Layer
+    2) Detect modified attributes in Working AGOL layer and edit them in the Working GDB
     3) Flag records that are marked Complete (FNLT and MIRR) 
        but have null values in any of the required attribute columns.
-    4) Move records marked 'Ready To Publish' from the working gdb into the staging gdb
+    4) Move records marked 'Ready To Publish' from the Working GDB into the Staging GDB
        Flag moved records overlapping with existing records in staging 
-    5) Removed deleted records (published and manually deleted from working) from the AGOL Feature Layer
+    5) Remove deleted records (Ready To Publish and manually deleted from working) from the Working AGOL Feature Layer
+    6) Update the Staging AGOL feature layer.
 
 
 Created on: 2025-04-23
@@ -65,7 +66,7 @@ class AGOConnector:
 class AGOSyncManager:
     def __init__(
         self, gis, working_fc, staging_fc, unique_id_field, 
-        today_date, agol_item_id_main
+        today_date, agol_item_id_working, agol_item_id_staging
     ):
         """
         Initialize the AGOSyncManager instance.
@@ -75,7 +76,8 @@ class AGOSyncManager:
         self.staging_fc = staging_fc
         self.unique_id_field = unique_id_field
         self.today_date = today_date
-        self.agol_item_id_main = agol_item_id_main
+        self.agol_item_id_working = agol_item_id_working
+        self.agol_item_id_staging = agol_item_id_staging
         self.agol_df = None
         self.local_df = None
         # Dictionary to hold detected changes
@@ -86,7 +88,6 @@ class AGOSyncManager:
             "move_published_to_staging": [],
             "flag_spatial_overlaps_staging": [],
             "delete_removed_records_from_agol": []
-
         }
 
 
@@ -94,7 +95,7 @@ class AGOSyncManager:
         """
         Returns a dataframe containing the records of an AGOL feature layer.
         """
-        item = self.gis.content.get(self.agol_item_id_main)
+        item = self.gis.content.get(self.agol_item_id_working)
         agol_layer = item.layers[0] 
         agol_features = agol_layer.query(
             where="1=1", 
@@ -142,7 +143,7 @@ class AGOSyncManager:
             print(f"..found {len(local_new)} new records in local dataset to append to AGOL.")
 
             # Retrieve the target AGOL feature layer.
-            item = self.gis.content.get(self.agol_item_id_main)
+            item = self.gis.content.get(self.agol_item_id_working)
             if not item:
                 raise ValueError("..AGOL feature layer not found.")
             agol_layer = item.layers[0]
@@ -372,7 +373,7 @@ class AGOSyncManager:
             self.change_log["delete_removed_records_from_agol"].extend(unique_ids)
             print(f"..deleted {len(unique_ids)} records from AGOL : {unique_ids}")
 
-            item = self.gis.content.get(self.agol_item_id_main)
+            item = self.gis.content.get(self.agol_item_id_working)
             layer = item.layers[0]
 
             def format_id(val):
@@ -424,6 +425,52 @@ class AGOSyncManager:
             print(f"..failed to export change log: {e}")
 
 
+    def overwrite_feature_layer(self, fc, agol_item_id: str, where_clause: str) -> None:
+        """
+        Overwrites a feature layer on AGO.
+        (No logging is performed in this function.)
+        """
+        print(f"..retrieving target layer with ID: {agol_item_id}")
+        item = self.gis.content.get(agol_item_id)
+        if not item:
+            raise ValueError(f"Feature layer with ID {agol_item_id} not found.")
+        
+        print(f"..found feature layer: {item.title}")
+        layer = item.layers[0]  
+        row_count = int(arcpy.GetCount_management(fc)[0])
+        print(f"..source feature class contains {row_count} rows")
+        print("..truncating the feature layer...")
+        layer.manager.truncate()
+        print("..feature layer truncated successfully.")
+        print("..adding new features to the layer...")
+
+        fields = [
+            field.name for field in arcpy.ListFields(fc) 
+                if field.name in self.agol_df.columns and field.type not in ["OID", "Geometry"]
+        ]
+        features = []
+        chunk_size = 5
+        with arcpy.da.SearchCursor(fc, ["SHAPE@"] + fields, where_clause) as cursor:
+            for row in cursor:
+                geom = row[0]
+                if geom is None:
+                    continue
+                geom_json = json.loads(geom.JSON)
+                attributes = {fields[i]: row[i + 1] for i in range(len(fields))}
+                features.append({"geometry": geom_json, "attributes": attributes})
+        for i in range(0, len(features), chunk_size):
+            chunk = features[i:i + chunk_size]
+            try:
+                result = layer.edit_features(adds=chunk)
+                if "addResults" in result and all(res["success"] for res in result["addResults"]):
+                    print(f"....successfully added {len(chunk)} features in batch {i//chunk_size + 1}")
+                else:
+                    raise ValueError(f"....failed to add features in batch {i//chunk_size + 1}.")
+            except Exception as e:
+                print(f"...error in batch {i//chunk_size + 1}: {e}")
+            time.sleep(2)
+
+
 
 def copy_featureclass(source_fc, target_gdb, target_fc_name, where_clause="") -> None:
     """
@@ -449,7 +496,6 @@ if __name__ == "__main__":
     working_fc = os.path.join(main_gdb, 'Sample_FNRI_working_testScript_v2')
     staging_fc = os.path.join(main_gdb, 'Sample_FNRI_staging_testScript_v2')
 
-
     print('Backing up the working and staging datasets...')
     today_date_f = datetime.now().strftime("%Y%m%d")
 
@@ -466,7 +512,7 @@ if __name__ == "__main__":
         archive_gdb, 
         backup_fc_name
     )  
- 
+
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
@@ -475,11 +521,12 @@ if __name__ == "__main__":
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
         gis = ago.connect()
 
-        unique_id_field = 'Poly_Unique_ID'  ###################### TBD ######################
+        unique_id_field = 'Poly_Unique_ID' 
 
         today_date = datetime.now()
 
-        agol_item_id_main = '8e871ec48e1f40d18ffeed647e1ec1e2'  
+        agol_item_id_working = '8e871ec48e1f40d18ffeed647e1ec1e2'
+        agol_item_id_staging = 'f6dd8b7196ca45188f4b19201a2dabc3'    
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -487,10 +534,11 @@ if __name__ == "__main__":
             staging_fc = staging_fc,
             unique_id_field=unique_id_field,
             today_date=today_date,
-            agol_item_id_main=agol_item_id_main,
+            agol_item_id_working=agol_item_id_working,
+            agol_item_id_staging=agol_item_id_staging
         )
 
-        print('\nRetrieving AGO layer records..')
+        print('\nRetrieving Working AGOL layer records..')
         agol = agol_sync_manager.get_agol_data()
         print(f'..AGOL layer contains {len(agol_sync_manager.agol_df)} rows')
 
@@ -499,10 +547,10 @@ if __name__ == "__main__":
         print(f'..Master dataset contains {len(agol_sync_manager.local_df)} rows')
 
         
-        print('\nAppending new Areas to AGOL..')
+        print('\nAppending new Areas to Working AGOL layer..')
         agol_sync_manager.append_new_areas_to_agol()
 
-        print('\nUpdating attributes modified in AGOL..')
+        print('\nUpdating attributes modified in Working AGOL layer..')
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.get_agol_data()  # re-read agol records
         agol_sync_manager.modify_edited_agol_attributes()
@@ -513,14 +561,22 @@ if __name__ == "__main__":
         agol_sync_manager.get_agol_data()  # re-read agol records
         agol_sync_manager.flag_missing_attributes()
 
-        print('\nMoving ready-to-publish records to staging…')
+        print('\nMoving ready-to-publish records to Staging GDB…')
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.move_published_to_staging()
 
-        print('\nDelete removed records from AGOL…')
+        print('\nDelete removed records from Working AGOL layer…')
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.get_agol_data()  # re-read agol records
-        agol_sync_manager.delete_removed_local_records_from_agol()        
+        agol_sync_manager.delete_removed_local_records_from_agol()  
+
+        print('\nUpdating the Staging AGO layer...')
+        agol_sync_manager.overwrite_feature_layer(
+            fc= staging_fc,
+            agol_item_id=agol_sync_manager.agol_item_id_staging, 
+                                                  where_clause="1=1"
+        )      
+
 
 
         print('\nExporting the change log…')
@@ -530,7 +586,8 @@ if __name__ == "__main__":
   
 
     except Exception as e:
-        print(f"Error occurred: {e}") 
+        print(f"Error occurred: {e}")
+
     finally:
         ago.disconnect()
 
