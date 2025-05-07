@@ -1,7 +1,6 @@
 """
 This script produces an Interim IPCA dataset for the AST tool 
 """
-
 import warnings
 warnings.simplefilter(action='ignore')
 
@@ -71,12 +70,12 @@ def cnslt_boundaries(df_ruls, gdf_pip) -> gpd.GeoDataFrame:
     return gdf_cnslt
 
 
-def produce_interim (gdf_bndr, gdf_cnslt) -> gpd.GeoDataFrame:
+def produce_interim (gdf_bndr, gdf_cnslt, gdf_f107) -> gpd.GeoDataFrame:
     """
     Returns a gdf of of interim IPCA dataset
     """
     gdf_intr = gpd.GeoDataFrame(
-        pd.concat([gdf_bndr, gdf_cnslt], ignore_index=True),
+        pd.concat([gdf_bndr, gdf_cnslt, gdf_f107], ignore_index=True),
         crs=gdf_bndr.crs
     )
 
@@ -95,7 +94,6 @@ def produce_interim (gdf_bndr, gdf_cnslt) -> gpd.GeoDataFrame:
     print (f'..IPCA interim dataset has {len(gdf_intr)} features')
 
     return gdf_intr
-
 
 
 if __name__ == "__main__":
@@ -121,8 +119,11 @@ if __name__ == "__main__":
     print("\nCreating a 'Consultation Boundaries' dataset...")
     gdf_cnslt = cnslt_boundaries(df_ruls, gdf_pip) 
 
+    print("\nReading special features...")
+    gdf_f107 = esri_to_gdf(os.path.join(intr_gdb, 'F107'))
+
     print("\nProducing the IPCA Interim dataset...")
-    gdf_intr = produce_interim (gdf_bndr, gdf_cnslt)
+    gdf_intr = produce_interim (gdf_bndr, gdf_cnslt, gdf_f107)
 
     gdf_intr.to_file(
         filename=intr_gdb,    
