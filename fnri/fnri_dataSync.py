@@ -10,9 +10,9 @@ The script executes the following workflow:
        but have null values in any of the required attribute columns.
     4) Move records marked 'Ready To Publish' from the Working GDB into the Staging GDB
        Flag moved records overlapping with existing records in staging 
-    5) Remove deleted records (Ready To Publish and manually deleted from working) from the Working AGOL Feature Layer
+       DATE_CREATED is populated with today's date
+    5) Remove deleted records (Ready To Publish and manually deleted from Working GDB) from the Working AGOL Feature Layer
     6) Update the Staging AGOL feature layer.
-
 
 Created on: 2025-04-23
 Author(s): Moez Labiadh
@@ -257,14 +257,15 @@ class AGOSyncManager:
         """
         required = [
             'FIRST_NATION', 'AGREEMENT_TYPE', 'AGREEMENT_STAGE',
-            'AGREEMENT_LINK', 'CONTACT_NAME', 'CONTACT_EMAIL', 'DATE_CREATED'
+            'AGREEMENT_LINK'
         ]
+
         df = self.local_df
         
         # condition: both review complete AND any required column is null
         mask = (
-            (df['Review_Status_FNLT'] == 'Complete') &
-            (df['Review_Status_MIRR'] == 'Complete')
+            (df['Review_Status_FNLT'] == 'Review Complete') &
+            (df['Review_Status_MIRR'] == 'Review Complete')
         ) & df[required].isnull().any(axis=1)
 
         missing = df.loc[mask, self.unique_id_field].tolist()
@@ -287,8 +288,8 @@ class AGOSyncManager:
         """
         df = self.local_df
         mask = (
-            (df['Review_Status_FNLT'] == 'Complete') &
-            (df['Review_Status_MIRR'] == 'Complete') &
+            (df['Review_Status_FNLT'] == 'Review Complete') &
+            (df['Review_Status_MIRR'] == 'Review Complete') &
             (df['Publish_Status']     == 'Ready to Publish')
         )
         to_move = df.loc[mask]
@@ -311,12 +312,22 @@ class AGOSyncManager:
             print(f"..removed {len(dup_ids)} existing records from staging: {sorted(dup_ids)}")
 
         # 2) Insert fresh copies
-        attr_fields = [c for c in to_move.columns if c != 'SHAPE']
+        staging_fields = [
+            f.name
+            for f in arcpy.ListFields(self.staging_fc)
+                if f.type not in ('Geometry', 'OID') and f.name.upper() != 'SHAPE'
+        ]
+        attr_fields = [col for col in to_move.columns if col in staging_fields]
         fields      = attr_fields + ['SHAPE@JSON']
         with arcpy.da.InsertCursor(self.staging_fc, fields) as inserter:
             for _, row in to_move.iterrows():
-                attrs = [row[f] if pd.notna(row[f]) else None for f in attr_fields]
-                geom  = json.dumps(row['SHAPE'])
+                attrs = []
+                for f in attr_fields:
+                    if f == 'DATE_CREATED':
+                        attrs.append(self.today_date)
+                    else:
+                        attrs.append(row[f] if pd.notna(row[f]) else None)
+                geom = json.dumps(row['SHAPE'])
                 inserter.insertRow(attrs + [geom])
         
         # 3) Delete moved records from working_fc
@@ -493,9 +504,12 @@ if __name__ == "__main__":
     wks = r"Q:\dss_workarea\shbeatti\for_Chloe"
     main_gdb = os.path.join(wks, 'Sample_FNRI_working.gdb')
     archive_gdb = os.path.join(wks, 'Sample_FNRI_backup.gdb')
-    working_fc = os.path.join(main_gdb, 'Sample_FNRI_working_testScript_v2')
-    staging_fc = os.path.join(main_gdb, 'Sample_FNRI_staging_testScript_v2')
+    working_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_working') ###### TEMPORARY DATA #######
+    staging_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_staging') ###### TEMPORARY DATA #######
 
+   
+
+    '''
     print('Backing up the working and staging datasets...')
     today_date_f = datetime.now().strftime("%Y%m%d")
 
@@ -512,7 +526,7 @@ if __name__ == "__main__":
         archive_gdb, 
         backup_fc_name
     )  
-
+    '''
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
@@ -525,8 +539,11 @@ if __name__ == "__main__":
 
         today_date = datetime.now()
 
-        agol_item_id_working = '8e871ec48e1f40d18ffeed647e1ec1e2'
-        agol_item_id_staging = 'f6dd8b7196ca45188f4b19201a2dabc3'    
+        agol_item_id_working = 'af906c27d8384a059928e232fed5d376' ###### TEMPORARY DATA #######
+        agol_item_id_staging = 'b0fd7e08b95d4ca7a29c2f65c97be2c5' ###### TEMPORARY DATA #######  
+
+        #agol_item_id_working = '8e871ec48e1f40d18ffeed647e1ec1e2' 
+        #agol_item_id_staging = 'f6dd8b7196ca45188f4b19201a2dabc3'  
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -574,7 +591,7 @@ if __name__ == "__main__":
         agol_sync_manager.overwrite_feature_layer(
             fc= staging_fc,
             agol_item_id=agol_sync_manager.agol_item_id_staging, 
-                                                  where_clause="1=1"
+            where_clause="1=1"
         )      
 
 
