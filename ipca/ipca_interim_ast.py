@@ -121,6 +121,7 @@ if __name__ == "__main__":
 
     print("\nReading special features...")
     gdf_f107 = esri_to_gdf(os.path.join(intr_gdb, 'F107'))
+    gdf_f107 = gdf_f107[['FEATURE_ID', 'FIRST_NATION_GROUP','geometry']]
 
     print("\nProducing the IPCA Interim dataset...")
     gdf_intr = produce_interim (gdf_bndr, gdf_cnslt, gdf_f107)
@@ -128,9 +129,8 @@ if __name__ == "__main__":
     gdf_intr.to_file(
         filename=intr_gdb,    
         driver="OpenFileGDB",                 
-        layer="interim_IPCA"    
+        layer="AST_interim_IPCA"    
     )
-
 
 
     finish_t = timeit.default_timer()
