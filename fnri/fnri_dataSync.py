@@ -13,6 +13,7 @@ The script executes the following workflow:
        DATE_CREATED is populated with today's date
     5) Remove deleted records (Ready To Publish and manually deleted from Working GDB) from the Working AGOL Feature Layer
     6) Update the Staging AGOL feature layer.
+       Staging records that fail to publish to AGOL are flagged in the Log file (usually due to topology issues with the geometry) 
 
 Created on: 2025-04-23
 Author(s): Moez Labiadh
@@ -29,6 +30,7 @@ from arcgis.gis import GIS
 from datetime import datetime
 import timeit
 import time
+import zipfile
 
 
 class AGOConnector:
@@ -87,7 +89,8 @@ class AGOSyncManager:
             "flag_missing_attributes": [],
             "move_published_to_staging": [],
             "flag_spatial_overlaps_staging": [],
-            "delete_removed_records_from_agol": []
+            "delete_removed_records_from_agol": [],
+            "flag_failed_to_ago_publish_staging": []
         }
 
 
@@ -401,6 +404,74 @@ class AGOSyncManager:
             print("..no records in AGO were removed (delete_removed_local_records_from_agol).")
 
 
+    def overwrite_feature_layer(self, fc, agol_item_id: str, where_clause: str) -> None:
+            """
+            Overwrites a feature layer on AGO by truncating it, then uploading
+            each record individually.  Any Poly_Unique_ID that fail to load
+            are collected and reported.
+            """
+            print(f"..retrieving target layer with ID: {agol_item_id}")
+            item = self.gis.content.get(agol_item_id)
+            if not item:
+                raise ValueError(f"Feature layer with ID {agol_item_id} not found.")
+            
+            layer = item.layers[0]  
+            print(f"..found feature layer: {item.title}")
+            
+            total_rows = int(arcpy.GetCount_management(fc)[0])
+            print(f"..source feature class contains {total_rows} rows")
+            
+            print("..truncating the feature layer...")
+            layer.manager.truncate()
+            print("..feature layer truncated successfully.")
+            
+            # determine which fields to upload
+            fields = [
+                f.name for f in arcpy.ListFields(fc)
+                if f.name in self.agol_df.columns and f.type not in ("OID", "Geometry")
+            ]
+
+            # build the search cursor
+            search_fields = ["SHAPE@"] + fields
+            failed_ids = []
+
+            print("..uploading records one by one...")
+            with arcpy.da.SearchCursor(fc, search_fields, where_clause) as cursor:
+                for row in cursor:
+                    geom = row[0]
+                    if geom is None:
+                        print("..skipping record with no geometry")
+                        continue
+
+                    # build the attributes dict
+                    attrs = {fields[i]: row[i + 1] for i in range(len(fields))}
+                    unique_id = attrs[self.unique_id_field]
+
+                    feature = {
+                        "geometry": json.loads(geom.JSON),
+                        "attributes": attrs
+                    }
+
+                    # try to add the single feature
+                    try:
+                        result = layer.edit_features(adds=[feature])
+                        add_res = result.get("addResults", [])
+                        if not add_res or not add_res[0].get("success", False):
+                            raise RuntimeError(add_res[0].get("error", "Unknown error"))
+                        print(f"..successfully added record {unique_id}")
+                    except Exception as e:
+                        print(f"..FAILED to add record {unique_id}: {e}")
+                        failed_ids.append(unique_id)
+
+                    # small pause to avoid hammering the service
+                    time.sleep(1)
+
+            if failed_ids:
+                print(f"\n..upload complete with failures ({len(failed_ids)}): {failed_ids}")
+                self.change_log["flag_failed_to_ago_publish_staging"].extend(failed_ids)
+            else:
+                print("\n..all records uploaded successfully.")
+
     def export_change_log(self, log_file_path: str) -> None:
         """
         Exports the collected change log information to a text file.
@@ -411,7 +482,8 @@ class AGOSyncManager:
             "flag_missing_attributes"         : "[QC/QA!] -  Ready-to-Publish Records with missing Attributes:",
             "move_published_to_staging"       : "Ready-to-Publish Records moved to staging dataset:",
             "flag_spatial_overlaps_staging"   : "[QC/QA!] -Records overlapping in staging",
-            "delete_removed_records_from_agol": "Records removed in AGOL"
+            "delete_removed_records_from_agol": "Records removed in AGOL",
+            "flag_failed_to_ago_publish_staging" : "[QC/QA!] -Staging records failed to publish to AGO",
 
         }
         try:
@@ -436,97 +508,71 @@ class AGOSyncManager:
             print(f"..failed to export change log: {e}")
 
 
-    def overwrite_feature_layer(self, fc, agol_item_id: str, where_clause: str) -> None:
-        """
-        Overwrites a feature layer on AGO.
-        (No logging is performed in this function.)
-        """
-        print(f"..retrieving target layer with ID: {agol_item_id}")
-        item = self.gis.content.get(agol_item_id)
-        if not item:
-            raise ValueError(f"Feature layer with ID {agol_item_id} not found.")
-        
-        print(f"..found feature layer: {item.title}")
-        layer = item.layers[0]  
-        row_count = int(arcpy.GetCount_management(fc)[0])
-        print(f"..source feature class contains {row_count} rows")
-        print("..truncating the feature layer...")
-        layer.manager.truncate()
-        print("..feature layer truncated successfully.")
-        print("..adding new features to the layer...")
 
-        fields = [
-            field.name for field in arcpy.ListFields(fc) 
-                if field.name in self.agol_df.columns and field.type not in ["OID", "Geometry"]
-        ]
-        features = []
-        chunk_size = 5
-        with arcpy.da.SearchCursor(fc, ["SHAPE@"] + fields, where_clause) as cursor:
-            for row in cursor:
-                geom = row[0]
-                if geom is None:
-                    continue
-                geom_json = json.loads(geom.JSON)
-                attributes = {fields[i]: row[i + 1] for i in range(len(fields))}
-                features.append({"geometry": geom_json, "attributes": attributes})
-        for i in range(0, len(features), chunk_size):
-            chunk = features[i:i + chunk_size]
-            try:
-                result = layer.edit_features(adds=chunk)
-                if "addResults" in result and all(res["success"] for res in result["addResults"]):
-                    print(f"....successfully added {len(chunk)} features in batch {i//chunk_size + 1}")
-                else:
-                    raise ValueError(f"....failed to add features in batch {i//chunk_size + 1}.")
-            except Exception as e:
-                print(f"...error in batch {i//chunk_size + 1}: {e}")
-            time.sleep(2)
-
-
-
-def copy_featureclass(source_fc, target_gdb, target_fc_name, where_clause="") -> None:
+def archive_geodatabase(gdb_path, archive_folder, today_date_str) -> None:
     """
-    Makes a copy of a featureclass based on a where_clause.
+    Walks the ESRI fgdb folder and zips up everything it can.
+    Any file that’s locked (PermissionError) will be skipped.
     """
-    destination_fc = os.path.join(target_gdb, target_fc_name)
-    if arcpy.Exists(destination_fc):
-        arcpy.Delete_management(destination_fc)
-    if where_clause:
-        arcpy.Select_analysis(source_fc, destination_fc, where_clause)
-    else:
-        arcpy.CopyFeatures_management(source_fc, destination_fc)
-    print("...dataset copied successfully!")
+    if not os.path.exists(gdb_path):
+        print(f"..archive skipped, gdb not found: {gdb_path}")
+        return
+
+    os.makedirs(archive_folder, exist_ok=True)
+    gdb_name = os.path.basename(gdb_path)
+    zip_path = os.path.join(
+        archive_folder,
+        f"{gdb_name}_archive_{today_date_str}.zip"
+    )
+
+    print(f"..creating archive: {gdb_name}")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # root_dir: parent of the .gdb folder so arcname keeps the .gdb name
+        root_dir = os.path.dirname(gdb_path)
+        for dirpath, dirnames, filenames in os.walk(gdb_path):
+            for filename in filenames:
+                full_path = os.path.join(dirpath, filename)
+                # build path inside zip so it mirrors the .gdb structure
+                arcname = os.path.relpath(full_path, root_dir)
+                
+                try:
+                    zf.write(full_path, arcname)
+                except PermissionError:
+                    pass
+                except Exception as e:
+                    pass
 
 
 
 if __name__ == "__main__":
     start_t = timeit.default_timer()
 
+    today_date = datetime.now()
+    today_date_str = today_date.strftime("%Y%m%d")
+
+    ###### TEMPORARY DATA #######
     wks = r"Q:\dss_workarea\shbeatti\for_Chloe"
+    archive_wks = os.path.join(wks, 'archive_test')
+
     main_gdb = os.path.join(wks, 'Sample_FNRI_working.gdb')
     archive_gdb = os.path.join(wks, 'Sample_FNRI_backup.gdb')
-    working_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_working') ###### TEMPORARY DATA #######
-    staging_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_staging') ###### TEMPORARY DATA #######
 
-   
+    working_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_working_v2') 
+    staging_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_staging_v2') 
 
-    '''
-    print('Backing up the working and staging datasets...')
-    today_date_f = datetime.now().strftime("%Y%m%d")
+    ###### TREAL DATA #######
+    #wks = r'\\spatialfiles.bcgov\Work\ilmb\dss_gis\projects\firstnat\First_Nations_Area_of_Interest_for_BCGW\data'
 
-    backup_fc_name = f"FNRI_working_{today_date_f}"
-    copy_featureclass(
-        working_fc, 
-        archive_gdb, 
-        backup_fc_name
-    )  
+    #working_gdb = os.path.join(wks, 'working_fnt_Areas_of_Interest.gdb') 
+    #staging_gdb = os.path.join(wks, 'fnt_Areas_of_Interest.gdb')         
 
-    backup_fc_name = f"FNRI_staging_{today_date_f}"
-    copy_featureclass(
-        staging_fc, 
-        archive_gdb, 
-        backup_fc_name
-    )  
-    '''
+    #working_fc = os.path.join(working_gdb, 'working_fnt_Areas_of_Interest') 
+    #staging_fc = os.path.join(staging_gdb, 'fnt_Areas_of_Interest')    
+         
+    print('Backing up the working and staging GDBs...')
+    for gdb in (main_gdb, archive_gdb):
+        archive_geodatabase(gdb, archive_wks, today_date_str)
+
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
@@ -537,13 +583,11 @@ if __name__ == "__main__":
 
         unique_id_field = 'Poly_Unique_ID' 
 
-        today_date = datetime.now()
-
         agol_item_id_working = 'af906c27d8384a059928e232fed5d376' ###### TEMPORARY DATA #######
         agol_item_id_staging = 'b0fd7e08b95d4ca7a29c2f65c97be2c5' ###### TEMPORARY DATA #######  
 
-        #agol_item_id_working = '8e871ec48e1f40d18ffeed647e1ec1e2' 
-        #agol_item_id_staging = 'f6dd8b7196ca45188f4b19201a2dabc3'  
+        #agol_item_id_working = '8e871ec48e1f40d18ffeed647e1ec1e2' ###### TREAL DATA #######
+        #agol_item_id_staging = 'f6dd8b7196ca45188f4b19201a2dabc3' ###### TREAL DATA ####### 
 
         agol_sync_manager = AGOSyncManager(
             gis=gis,
@@ -563,7 +607,7 @@ if __name__ == "__main__":
         loc= agol_sync_manager.get_local_data()
         print(f'..Master dataset contains {len(agol_sync_manager.local_df)} rows')
 
-        
+
         print('\nAppending new Areas to Working AGOL layer..')
         agol_sync_manager.append_new_areas_to_agol()
 
@@ -587,6 +631,7 @@ if __name__ == "__main__":
         agol_sync_manager.get_agol_data()  # re-read agol records
         agol_sync_manager.delete_removed_local_records_from_agol()  
 
+
         print('\nUpdating the Staging AGO layer...')
         agol_sync_manager.overwrite_feature_layer(
             fc= staging_fc,
@@ -594,8 +639,7 @@ if __name__ == "__main__":
             where_clause="1=1"
         )      
 
-
-
+        
         print('\nExporting the change log…')
         today_date_f = datetime.now().strftime("%Y%m%d")
         log_file = os.path.join(wks, 'FNRI_dataSync_log' ,f"change_log_{today_date_f}.txt")
