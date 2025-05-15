@@ -3,16 +3,26 @@ This script synchronizes records between the local FNRI working and
 staging datasets (gdb/featureclass) and the FNRI Feature Layer on AGOL.
 
 The script executes the following workflow:
-    0) Create a backup copy of the Working and Staging featureclasses
-    1) Detect new Areas from the Working GDB and append them to the Working AGOL Feature Layer
-    2) Detect modified attributes in Working AGOL layer and edit them in the Working GDB
-    3) Flag records that are marked Complete (FNLT and MIRR) 
+    0) Create a backup copy of the Working and Staging Geodatabases
+
+    1) Detect new Records from the Working GDB and append them to the Working AGOL Feature Layer
+
+    2) Delete Records marked as "To Be Retired" from the Working AGOL and GDB datasets
+
+    3) Detect modified attributes in Working AGOL layer and edit them in the Working GDB
+
+    4) Flag records that are marked Complete (FNLT and MIRR) 
        but have null values in any of the required attribute columns.
-    4) Move records marked 'Ready To Publish' from the Working GDB into the Staging GDB
+
+    5) Move records marked 'Ready To Publish' from the Working GDB into the Staging GDB
        Flag moved records overlapping with existing records in staging 
+       When a record is moved and its unique ID matches an existing one in staging , the existing record will be overwritten.
        DATE_CREATED is populated with today's date
-    5) Remove deleted records (Ready To Publish and manually deleted from Working GDB) from the Working AGOL Feature Layer
-    6) Update the Staging AGOL feature layer.
+       Records moved to staging GDB will have their Publish_Status set to "Published"
+
+    6) Remove deleted records (Ready To Publish and manually deleted from Working GDB) from the Working AGOL Feature Layer
+
+    7) Overwrite the Staging AGOL feature layer with data from the Staging GDB .
        Staging records that fail to publish to AGOL are flagged in the Log file (usually due to topology issues with the geometry) 
 
 Created on: 2025-04-23
@@ -85,6 +95,7 @@ class AGOSyncManager:
         # Dictionary to hold detected changes
         self.change_log = {
             "append_new_areas_to_agol": [],
+            "retired_records_deleted" : [],
             "modify_edited_agol_attributes": [],
             "flag_missing_attributes": [],
             "move_published_to_staging": [],
@@ -180,6 +191,54 @@ class AGOSyncManager:
                 print("..no records were added to AGOL. Check for errors.")
         else:
             print("..no new records to append to AGOL.")
+
+
+    def delete_retired_working_records(self) -> None:
+            """
+            Deletes records from both the Working AGOL and GDB
+            whose Publish_Status field is set to 'To be Retired from Working Data'.
+            (Logs: Retired records deleted)
+            """
+            # Identify records in AGOL marked for deletion
+            agol_to_delete = self.agol_df[self.agol_df['Publish_Status'] == 'To be Retired from Working Data']
+            
+            if agol_to_delete.empty:
+                print("..no records marked for deletion found.")
+                return
+            
+            unique_ids = agol_to_delete[self.unique_id_field].tolist()
+
+            # Delete from AGOL Feature Layer
+            item = self.gis.content.get(self.agol_item_id_working)
+            layer = item.layers[0]
+            
+            def format_id(val):
+                return f"'{val}'" if isinstance(val, str) else str(val)
+            
+            ids_str = ", ".join(format_id(val) for val in unique_ids)
+            where_clause = f"{self.unique_id_field} in ({ids_str})"
+            result = layer.delete_features(where=where_clause)
+            
+            if result.get("deleteResults"):
+                if all(r.get("success") for r in result["deleteResults"]):
+                    print(f"..successfully deleted {len(unique_ids)} records from Working AGOL: {unique_ids}")
+                else:
+                    print("..failed to delete some records from AGOL.")
+            else:
+                print("..failed to delete records from AGOL.")
+            
+            # Delete from the Master dataset feature class
+            deleted_ids = []
+            with arcpy.da.UpdateCursor(self.working_fc, [self.unique_id_field]) as cursor:
+                for row in cursor:
+                    if row[0] in unique_ids:
+                        deleted_ids.append(row[0])
+                        cursor.deleteRow()
+
+            print(f"..successfully deleted {len(deleted_ids)} record(s) from Working GDB: {deleted_ids}")
+            
+            self.change_log["retired_records_deleted"].extend(unique_ids)
+
 
 
     def modify_edited_agol_attributes(self) -> None:
@@ -320,14 +379,21 @@ class AGOSyncManager:
             for f in arcpy.ListFields(self.staging_fc)
                 if f.type not in ('Geometry', 'OID') and f.name.upper() != 'SHAPE'
         ]
+        # only keep those fields that exist in to_move
         attr_fields = [col for col in to_move.columns if col in staging_fields]
+        # build the full field list including geometry
         fields      = attr_fields + ['SHAPE@JSON']
+
         with arcpy.da.InsertCursor(self.staging_fc, fields) as inserter:
             for _, row in to_move.iterrows():
                 attrs = []
                 for f in attr_fields:
                     if f == 'DATE_CREATED':
+                        # stamp creation date
                         attrs.append(self.today_date)
+                    elif f == 'Publish_Status':
+                        # override to “Published” when moving
+                        attrs.append('Published')
                     else:
                         attrs.append(row[f] if pd.notna(row[f]) else None)
                 geom = json.dumps(row['SHAPE'])
@@ -478,14 +544,15 @@ class AGOSyncManager:
         """
         header_mapping = {
             "append_new_areas_to_agol"        : "New Areas added to AGOL:",
+            "retired_records_deleted"         : "Retired records deleted",
             "modify_edited_agol_attributes"   : "Records modified in AGOL:",
             "flag_missing_attributes"         : "[QC/QA!] -  Ready-to-Publish Records with missing Attributes:",
             "move_published_to_staging"       : "Ready-to-Publish Records moved to staging dataset:",
             "flag_spatial_overlaps_staging"   : "[QC/QA!] -Records overlapping in staging",
-            "delete_removed_records_from_agol": "Records removed in AGOL",
-            "flag_failed_to_ago_publish_staging" : "[QC/QA!] -Staging records failed to publish to AGO",
-
+            "delete_removed_records_from_agol": "Records removed in Working AGOL",
+            "flag_failed_to_ago_publish_staging" : "[QC/QA!] -Staging records failed to publish to AGO"
         }
+
         try:
             with open(log_file_path, 'w') as f:
                 header = f"Change Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -561,18 +628,18 @@ if __name__ == "__main__":
     staging_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_staging_v2') 
 
     ###### TREAL DATA #######
-    #wks = r'\\spatialfiles.bcgov\Work\ilmb\dss_gis\projects\firstnat\First_Nations_Area_of_Interest_for_BCGW\data'
+    #wks = r'N:\projects\firstnat\First_Nations_Area_of_Interest_for_BCGW\data'
 
     #working_gdb = os.path.join(wks, 'working_fnt_Areas_of_Interest.gdb') 
     #staging_gdb = os.path.join(wks, 'fnt_Areas_of_Interest.gdb')         
 
     #working_fc = os.path.join(working_gdb, 'working_fnt_Areas_of_Interest') 
     #staging_fc = os.path.join(staging_gdb, 'fnt_Areas_of_Interest')    
-         
+    '''     
     print('Backing up the working and staging GDBs...')
     for gdb in (main_gdb, archive_gdb):
         archive_geodatabase(gdb, archive_wks, today_date_str)
-
+    '''
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
@@ -611,12 +678,16 @@ if __name__ == "__main__":
         print('\nAppending new Areas to Working AGOL layer..')
         agol_sync_manager.append_new_areas_to_agol()
 
+        print('\nDeleting Records marked for retirement in the Working AGOL..')
+        agol_sync_manager.get_local_data() # re-read local records
+        agol_sync_manager.get_agol_data()  # re-read agol records
+        agol_sync_manager.delete_retired_working_records()
+
         print('\nUpdating attributes modified in Working AGOL layer..')
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.get_agol_data()  # re-read agol records
         agol_sync_manager.modify_edited_agol_attributes()
         
-
         print('\nFlagging ready-to-publish records with missing attributes…')
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.get_agol_data()  # re-read agol records
