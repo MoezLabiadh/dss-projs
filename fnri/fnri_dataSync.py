@@ -1,11 +1,11 @@
 """
 This script synchronizes records between the local FNRI working and 
-staging datasets (gdb/featureclass) and the FNRI Feature Layer on AGOL.
+staging datasets (gdb/featureclass) and the FNRI Feature Layers on AGOL.
 
 The script executes the following workflow:
     0) Create a backup copy of the Working and Staging Geodatabases
 
-    1) Detect new Records from the Working GDB and append them to the Working AGOL Feature Layer
+    1) Detect new Records added to the Working GDB and append them to the Working AGOL Feature Layer
 
     2) Delete Records marked as "To Be Retired" from the Working AGOL and GDB datasets
 
@@ -15,14 +15,12 @@ The script executes the following workflow:
        but have null values in any of the required attribute columns.
 
     5) Move records marked 'Ready To Publish' from the Working GDB into the Staging GDB
-       Flag moved records overlapping with existing records in staging 
-       When a record is moved and its unique ID matches an existing one in staging , the existing record will be overwritten.
-       DATE_CREATED is populated with today's date
-       Records moved to staging GDB will have their Publish_Status set to "Published"
+       When a record is moved and its unique ID matches an existing one in staging, the existing record will be overwritten.
+       Flag moved records overlapping with existing records in the Staging GDB 
+       DATE_CREATED is populated with today's date for moved records
+       Set the Publish_Status of records moved to staging GDB to "Published"
 
-    6) Remove deleted records (Ready To Publish and manually deleted from Working GDB) from the Working AGOL Feature Layer
-
-    7) Overwrite the Staging AGOL feature layer with data from the Staging GDB .
+    6) Overwrite the Staging AGOL feature layer with data from the Staging GDB .
        Staging records that fail to publish to AGOL are flagged in the Log file (usually due to topology issues with the geometry) 
 
 Created on: 2025-04-23
@@ -100,7 +98,6 @@ class AGOSyncManager:
             "flag_missing_attributes": [],
             "move_published_to_staging": [],
             "flag_spatial_overlaps_staging": [],
-            "delete_removed_records_from_agol": [],
             "flag_failed_to_ago_publish_staging": []
         }
 
@@ -399,18 +396,35 @@ class AGOSyncManager:
                 geom = json.dumps(row['SHAPE'])
                 inserter.insertRow(attrs + [geom])
         
-        # 3) Delete moved records from working_fc
+        # 3) Delete moved records from Working GDB
         delete_clause = f"{self.unique_id_field} IN ({','.join(repr(i) for i in ids_to_move)})"
         with arcpy.da.UpdateCursor(self.working_fc, [self.unique_id_field], delete_clause) as cursor:
             for _ in cursor:
                 cursor.deleteRow()
+
+        # 4) Delete moved records from Working AGO
+        item = self.gis.content.get(self.agol_item_id_working)
+        layer = item.layers[0]
+
+        def format_id(val):
+            return f"'{val}'" if isinstance(val, str) else str(val)
+        
+        ids_str = ", ".join(format_id(val) for val in ids_to_move)
+        where_clause = f"{self.unique_id_field} in ({ids_str})"
+        result = layer.delete_features(where=where_clause)
+        if result.get("deleteResults"):
+            if not all(r.get("success") for r in result["deleteResults"]):
+                print("..failed to delete some records from AGO.")
+        else:
+            print("..failed to delete records from AGO.")
+
 
         # Log moved IDs
         moved_ids = sorted(ids_to_move)
         self.change_log["move_published_to_staging"].extend(moved_ids)
         print(f"..moved {len(moved_ids)} records to staging: {moved_ids}")
 
-        # 4) Spatial overlap check
+        # 5) Spatial overlap check
         if arcpy.Exists("staging_lyr"):
             arcpy.Delete_management("staging_lyr")
         arcpy.management.MakeFeatureLayer(self.staging_fc, "staging_lyr")
@@ -439,35 +453,6 @@ class AGOSyncManager:
             print(f"..flagged records overlapping in staging: {sorted(overlap_ids)}")
 
 
-    def delete_removed_local_records_from_agol(self) -> None:
-        """
-        Deletes records from the working AGO feature layer that are no longer present 
-        in the working local dataset.
-        (Logs: Records removed in AGOL)
-        """
-        agol_deleted = self.agol_df[
-            ~self.agol_df[self.unique_id_field].isin(self.local_df[self.unique_id_field])
-        ]
-        if not agol_deleted.empty:
-            unique_ids = agol_deleted[self.unique_id_field].tolist()
-            self.change_log["delete_removed_records_from_agol"].extend(unique_ids)
-            print(f"..deleted {len(unique_ids)} records from AGOL : {unique_ids}")
-
-            item = self.gis.content.get(self.agol_item_id_working)
-            layer = item.layers[0]
-
-            def format_id(val):
-                return f"'{val}'" if isinstance(val, str) else str(val)
-            ids_str = ", ".join(format_id(val) for val in unique_ids)
-            where_clause = f"{self.unique_id_field} in ({ids_str})"
-            result = layer.delete_features(where=where_clause)
-            if result.get("deleteResults"):
-                if not all(r.get("success") for r in result["deleteResults"]):
-                    print("..failed to delete some records from AGO.")
-            else:
-                print("..failed to delete records from AGO.")
-        else:
-            print("..no records in AGO were removed (delete_removed_local_records_from_agol).")
 
 
     def overwrite_feature_layer(self, fc, agol_item_id: str, where_clause: str) -> None:
@@ -524,9 +509,9 @@ class AGOSyncManager:
                         add_res = result.get("addResults", [])
                         if not add_res or not add_res[0].get("success", False):
                             raise RuntimeError(add_res[0].get("error", "Unknown error"))
-                        print(f"..successfully added record {unique_id}")
+                        print(f"...successfully added record {unique_id}")
                     except Exception as e:
-                        print(f"..FAILED to add record {unique_id}: {e}")
+                        print(f"...FAILED to add record {unique_id}: {e}")
                         failed_ids.append(unique_id)
 
                     # small pause to avoid hammering the service
@@ -538,19 +523,20 @@ class AGOSyncManager:
             else:
                 print("\n..all records uploaded successfully.")
 
+
+
     def export_change_log(self, log_file_path: str) -> None:
         """
         Exports the collected change log information to a text file.
         """
         header_mapping = {
-            "append_new_areas_to_agol"        : "New Areas added to AGOL:",
-            "retired_records_deleted"         : "Retired records deleted",
-            "modify_edited_agol_attributes"   : "Records modified in AGOL:",
-            "flag_missing_attributes"         : "[QC/QA!] -  Ready-to-Publish Records with missing Attributes:",
-            "move_published_to_staging"       : "Ready-to-Publish Records moved to staging dataset:",
-            "flag_spatial_overlaps_staging"   : "[QC/QA!] -Records overlapping in staging",
-            "delete_removed_records_from_agol": "Records removed in Working AGOL",
-            "flag_failed_to_ago_publish_staging" : "[QC/QA!] -Staging records failed to publish to AGO"
+            "append_new_areas_to_agol"        : "New Records/Areas added to the Working Data:",
+            "retired_records_deleted"         : "To-be-Retired records deleted from the Working Data:",
+            "modify_edited_agol_attributes"   : "Records with Attributes modified in the Working Data:",
+            "flag_missing_attributes"         : "[QC/QA!] Working Data Records set to Ready-to-Publish with missing mandatory Attributes:",
+            "move_published_to_staging"       : "Working Data Records set to Ready-to-Publish moved to Published Data:",
+            "flag_spatial_overlaps_staging"   : "[QC/QA!] New Published records overlapping existing records in Published Data:",
+            "flag_failed_to_ago_publish_staging" : "[QC/QA!] Staging Data failed to publish to Staging AGO:"
         }
 
         try:
@@ -696,11 +682,6 @@ if __name__ == "__main__":
         print('\nMoving ready-to-publish records to Staging GDB…')
         agol_sync_manager.get_local_data() # re-read local records
         agol_sync_manager.move_published_to_staging()
-
-        print('\nDelete removed records from Working AGOL layer…')
-        agol_sync_manager.get_local_data() # re-read local records
-        agol_sync_manager.get_agol_data()  # re-read agol records
-        agol_sync_manager.delete_removed_local_records_from_agol()  
 
 
         print('\nUpdating the Staging AGO layer...')
