@@ -2,6 +2,8 @@
 This script synchronizes records between the local FNRI working and 
 staging datasets (gdb/featureclass) and the FNRI Feature Layers on AGOL.
 
+The script exports a log file detailing the number of changes performed and the IDs affected.  
+
 The script executes the following workflow:
     0) Create a backup copy of the Working and Staging Geodatabases
 
@@ -11,7 +13,7 @@ The script executes the following workflow:
 
     3) Detect modified attributes in Working AGOL layer and edit them in the Working GDB
 
-    4) Flag records that are marked Complete (FNLT and MIRR) 
+    4) Flag records that are marked Review Complete (FNLT and MIRR) 
        but have null values in any of the required attribute columns.
 
     5) Move records marked 'Ready To Publish' from the Working GDB into the Staging GDB
@@ -22,6 +24,9 @@ The script executes the following workflow:
 
     6) Overwrite the Staging AGOL feature layer with data from the Staging GDB .
        Staging records that fail to publish to AGOL are flagged in the Log file (usually due to topology issues with the geometry) 
+    
+    7) Overwrites the BCGW staging GDB with the content of the local staging GDB
+
 
 Created on: 2025-04-23
 Author(s): Moez Labiadh
@@ -218,7 +223,7 @@ class AGOSyncManager:
             
             if result.get("deleteResults"):
                 if all(r.get("success") for r in result["deleteResults"]):
-                    print(f"..successfully deleted {len(unique_ids)} records from Working AGOL: {unique_ids}")
+                    print(f"..successfully deleted {len(unique_ids)} record(s) from Working AGOL: {unique_ids}")
                 else:
                     print("..failed to delete some records from AGOL.")
             else:
@@ -246,7 +251,7 @@ class AGOSyncManager:
             edit_fields = [
                 'FIRST_NATION', 'AGREEMENT_TYPE', 'AGREEMENT_STAGE',
                 'AGREEMENT_LINK', 'CONTACT_NAME', 'CONTACT_EMAIL', 'DATE_CREATED',
-                'Review_Status_FNLT', 'Review_Status_MIRR', 'Publish_Status'
+                'Parcel_Name', 'Review_Status_FNLT', 'Review_Status_MIRR', 'Publish_Status'
             ]
             uid = self.unique_id_field
 
@@ -310,30 +315,40 @@ class AGOSyncManager:
 
     def flag_missing_attributes(self) -> None:
         """
-        Flags Parcel_Name(s) that are marked Complete (FNLT or MIRR)
-        but have null values in any of the required attribute columns.
-        (Logs: [QC/QA!] -  Ready-to-Publish Records with missing Attributes)
+        Flags records set to 'Ready to Publish' that either
+        - have incomplete review status, or
+        - are missing any required attribute.
+        (Logs: [QC/QA!] Working Data Records set to Ready-to-Publish with missing mandatory Attributes)
         """
         required = [
             'FIRST_NATION', 'AGREEMENT_TYPE', 'AGREEMENT_STAGE',
             'AGREEMENT_LINK'
         ]
-
         df = self.local_df
-        
-        # condition: both review complete AND any required column is null
-        mask = (
-            (df['Review_Status_FNLT'] == 'Review Complete') &
-            (df['Review_Status_MIRR'] == 'Review Complete')
-        ) & df[required].isnull().any(axis=1)
 
-        missing = df.loc[mask, self.unique_id_field].tolist()
-        if missing:
-            print(f"..flagged {len(missing)} ready-to-publish records missing attributes: {missing}")
-            # add to change log
-            self.change_log.setdefault('flag_missing_attributes', []).extend(missing)
+        # only look at records ready to publish
+        ready = df['Publish_Status'] == 'Ready to Publish'
+
+        # review-status violation: either FNLT or MIRR is not complete
+        bad_review = (
+            (df['Review_Status_FNLT'] != 'Review Complete') |
+            (df['Review_Status_MIRR']   != 'Review Complete')
+        )
+
+        # missing-attribute violation: any required column is null
+        missing_attr = df[required].isnull().any(axis=1)
+
+        # combine both checks
+        mask = ready & (bad_review | missing_attr)
+
+        # collect IDs
+        flagged_ids = df.loc[mask, self.unique_id_field].tolist()
+
+        if flagged_ids:
+            print(f"..flagged {len(flagged_ids)} ready-to-publish records with issues: {flagged_ids}")
+            self.change_log.setdefault('flag_missing_attributes', []).extend(flagged_ids)
         else:
-            print("..no ready-to-publish records missing attributes.")
+            print("..no ready-to-publish records with missing attributes or incomplete review.")
 
 
     def move_published_to_staging(self) -> None:
@@ -347,10 +362,9 @@ class AGOSyncManager:
         """
         df = self.local_df
         mask = (
-            (df['Review_Status_FNLT'] == 'Review Complete') &
-            (df['Review_Status_MIRR'] == 'Review Complete') &
-            (df['Publish_Status']     == 'Ready to Publish')
+            df['Publish_Status'] == 'Ready to Publish'
         )
+
         to_move = df.loc[mask]
         if to_move.empty:
             print("..no records ready to publish to staging.")
@@ -453,75 +467,83 @@ class AGOSyncManager:
             print(f"..flagged records overlapping in staging: {sorted(overlap_ids)}")
 
 
-
-
     def overwrite_feature_layer(self, fc, agol_item_id: str, where_clause: str) -> None:
-            """
-            Overwrites a feature layer on AGO by truncating it, then uploading
-            each record individually.  Any Poly_Unique_ID that fail to load
-            are collected and reported.
-            """
-            print(f"..retrieving target layer with ID: {agol_item_id}")
-            item = self.gis.content.get(agol_item_id)
-            if not item:
-                raise ValueError(f"Feature layer with ID {agol_item_id} not found.")
-            
-            layer = item.layers[0]  
-            print(f"..found feature layer: {item.title}")
-            
-            total_rows = int(arcpy.GetCount_management(fc)[0])
-            print(f"..source feature class contains {total_rows} rows")
-            
-            print("..truncating the feature layer...")
-            layer.manager.truncate()
-            print("..feature layer truncated successfully.")
-            
-            # determine which fields to upload
-            fields = [
-                f.name for f in arcpy.ListFields(fc)
-                if f.name in self.agol_df.columns and f.type not in ("OID", "Geometry")
-            ]
+        """
+        Overwrites a feature layer on AGOL by truncating it, then uploading
+        each record individually. Any Poly_Unique_ID that fail to load
+        are retried with a 5 m geometry simplification; final failures  
+        are logged in flag_failed_to_ago_publish_staging".
+        """
+        print(f"..retrieving target layer with ID: {agol_item_id}")
+        item = self.gis.content.get(agol_item_id)
+        if not item:
+            raise ValueError(f"Feature layer with ID {agol_item_id} not found.")
 
-            # build the search cursor
-            search_fields = ["SHAPE@"] + fields
-            failed_ids = []
+        layer = item.layers[0]
+        print(f"..found feature layer: {item.title}")
 
-            print("..uploading records one by one...")
-            with arcpy.da.SearchCursor(fc, search_fields, where_clause) as cursor:
-                for row in cursor:
-                    geom = row[0]
-                    if geom is None:
-                        print("..skipping record with no geometry")
-                        continue
+        print("..truncating the feature layer...")
+        layer.manager.truncate()
+        print("..feature layer truncated successfully.")
 
-                    # build the attributes dict
-                    attrs = {fields[i]: row[i + 1] for i in range(len(fields))}
-                    unique_id = attrs[self.unique_id_field]
+        # pick only those fields present in both AGOL and the FC, excluding OID/Geometry
+        fields = [
+            f.name for f in arcpy.ListFields(fc)
+            if f.name in self.agol_df.columns and f.type not in ("OID", "Geometry")
+        ]
 
-                    feature = {
-                        "geometry": json.loads(geom.JSON),
-                        "attributes": attrs
-                    }
+        search_fields = ["SHAPE@"] + fields
+        failed_ids = []
 
-                    # try to add the single feature
+        def try_add(feat):
+            resp = layer.edit_features(adds=[feat])
+            results = resp.get("addResults", [])
+            if results and results[0].get("success"):
+                return
+            err = results[0].get("error", "unknown") if results else "no result"
+            raise RuntimeError(err)
+
+        print("..uploading records one by one...")
+        with arcpy.da.SearchCursor(fc, search_fields, where_clause) as cursor:
+            for row in cursor:
+                geom = row[0]
+                if geom is None:
+                    print("..skipping record with no geometry")
+                    continue
+
+                attrs = {fields[i]: row[i+1] for i in range(len(fields))}
+                uid = attrs[self.unique_id_field]
+
+                feature = {
+                    "geometry": json.loads(geom.JSON),
+                    "attributes": attrs
+                }
+
+                # first attempt
+                try:
+                    try_add(feature)
+                    print(f"...added {uid}")
+                except Exception as e1:
+                    print(f"...FAILED {uid}: {e1}")
+                    # retry with simplified geometry
+                    print(f"...simplifying {uid} by 5 m and retrying")
+                    simple = geom.generalize(5)
+                    feature["geometry"] = json.loads(simple.JSON)
                     try:
-                        result = layer.edit_features(adds=[feature])
-                        add_res = result.get("addResults", [])
-                        if not add_res or not add_res[0].get("success", False):
-                            raise RuntimeError(add_res[0].get("error", "Unknown error"))
-                        print(f"...successfully added record {unique_id}")
-                    except Exception as e:
-                        print(f"...FAILED to add record {unique_id}: {e}")
-                        failed_ids.append(unique_id)
+                        try_add(feature)
+                        print(f"...added simplified {uid}")
+                    except Exception as e2:
+                        print(f"...STILL FAILED {uid}: {e2}")
+                        failed_ids.append(uid)
 
-                    # small pause to avoid hammering the service
-                    time.sleep(1)
+                time.sleep(1)
 
-            if failed_ids:
-                print(f"\n..upload complete with failures ({len(failed_ids)}): {failed_ids}")
-                self.change_log["flag_failed_to_ago_publish_staging"].extend(failed_ids)
-            else:
-                print("\n..all records uploaded successfully.")
+        # report
+        if failed_ids:
+            print(f"\n..upload complete with {len(failed_ids)} final failures: {failed_ids}")
+            self.change_log.setdefault("flag_failed_to_ago_publish_staging", []).extend(failed_ids)
+        else:
+            print("\n..all records uploaded successfully.")
 
 
 
@@ -530,13 +552,13 @@ class AGOSyncManager:
         Exports the collected change log information to a text file.
         """
         header_mapping = {
-            "append_new_areas_to_agol"        : "New Records/Areas added to the Working Data:",
-            "retired_records_deleted"         : "To-be-Retired records deleted from the Working Data:",
-            "modify_edited_agol_attributes"   : "Records with Attributes modified in the Working Data:",
-            "flag_missing_attributes"         : "[QC/QA!] Working Data Records set to Ready-to-Publish with missing mandatory Attributes:",
-            "move_published_to_staging"       : "Working Data Records set to Ready-to-Publish moved to Published Data:",
-            "flag_spatial_overlaps_staging"   : "[QC/QA!] New Published records overlapping existing records in Published Data:",
-            "flag_failed_to_ago_publish_staging" : "[QC/QA!] Staging Data failed to publish to Staging AGO:"
+            "append_new_areas_to_agol"          : "New Records/Areas added to the Working Data:",
+            "retired_records_deleted"           : "To-be-Retired records deleted from the Working Data:",
+            "modify_edited_agol_attributes"     : "Records with Attributes modified in the Working Data:",
+            "flag_missing_attributes"           : "[QC/QA!] Working Data Records set to Ready-to-Publish with Attribute issues:",
+            "move_published_to_staging"         : "Working Data Records set to Ready-to-Publish moved to Published Data:",
+            "flag_spatial_overlaps_staging"     : "[QC/QA!] New Published records overlapping existing records in Published Data:",
+            "flag_failed_to_ago_publish_staging": "[QC/QA!] Staging Data failed to publish to Staging AGO:"
         }
 
         try:
@@ -575,7 +597,7 @@ def archive_geodatabase(gdb_path, archive_folder, today_date_str) -> None:
     gdb_name = os.path.basename(gdb_path)
     zip_path = os.path.join(
         archive_folder,
-        f"{gdb_name}_archive_{today_date_str}.zip"
+        f"{today_date_str}_backup_{gdb_name}.zip"
     )
 
     print(f"..creating archive: {gdb_name}")
@@ -596,6 +618,25 @@ def archive_geodatabase(gdb_path, archive_folder, today_date_str) -> None:
                     pass
 
 
+def overwrite_bcgw_staging(staging_fc, bcgw_staging_fc):
+    """
+    Overwrites the BCGW staging GDB with the contents of the local staging GDB
+    1) Truncates (clears) the target feature class
+    2) Appends all features from staging_fc    
+    """
+    # 1) remove all existing features from the BCGW staging FC
+    arcpy.management.TruncateTable(bcgw_staging_fc)
+    print("....target truncated") 
+
+    # 2) append everything in staging_fc into bcgw_staging_fc
+    arcpy.management.Append(
+        inputs=[staging_fc],
+        target=bcgw_staging_fc,
+        schema_type="NO_TEST"
+    )
+    print("....features appended")  
+
+
 
 if __name__ == "__main__":
     start_t = timeit.default_timer()
@@ -614,7 +655,7 @@ if __name__ == "__main__":
     staging_fc = os.path.join(main_gdb, 'fnt_Areas_of_Interest_test_staging_v2') 
 
     ###### TREAL DATA #######
-    #wks = r'N:\projects\firstnat\First_Nations_Area_of_Interest_for_BCGW\data'
+    #wks = r'\\spatialfiles.bcgov\Work\ilmb\dss_gis\projects\firstnat\First_Nations_Area_of_Interest_for_BCGW\data'
 
     #working_gdb = os.path.join(wks, 'working_fnt_Areas_of_Interest.gdb') 
     #staging_gdb = os.path.join(wks, 'fnt_Areas_of_Interest.gdb')         
@@ -629,8 +670,8 @@ if __name__ == "__main__":
     try:
         print('\nLogging to AGO...')
         AGO_HOST = 'https://governmentofbc.maps.arcgis.com'
-        AGO_USERNAME_DSS = 'XXX' 
-        AGO_PASSWORD_DSS = 'XXX' 
+        AGO_USERNAME_DSS = 'XXXX' 
+        AGO_PASSWORD_DSS = 'XXXX' 
         ago = AGOConnector(AGO_HOST, AGO_USERNAME_DSS, AGO_PASSWORD_DSS)
         gis = ago.connect()
 
@@ -689,20 +730,24 @@ if __name__ == "__main__":
             fc= staging_fc,
             agol_item_id=agol_sync_manager.agol_item_id_staging, 
             where_clause="1=1"
-        )      
-
-        
-        print('\nExporting the change log…')
-        today_date_f = datetime.now().strftime("%Y%m%d")
-        log_file = os.path.join(wks, 'FNRI_dataSync_log' ,f"change_log_{today_date_f}.txt")
-        agol_sync_manager.export_change_log(log_file)
-  
+        )
+    
 
     except Exception as e:
         print(f"Error occurred: {e}")
 
     finally:
         ago.disconnect()
+
+        print('\nExporting the change log…')
+        today_date_f = datetime.now().strftime("%Y%m%d")
+        log_file = os.path.join(wks, 'FNRI_dataSync_log' ,f"change_log_{today_date_f}.txt")
+        agol_sync_manager.export_change_log(log_file)
+
+        print("\nSyncing local staging to BCGW…")
+        bcgw_staging_gdb = os.path.join(wks, 'fnt_Areas_of_Interest.gdb')
+        bcgw_staging_fc = os.path.join(bcgw_staging_gdb, 'fnt_Areas_of_Interest')
+        overwrite_bcgw_staging(staging_fc, bcgw_staging_fc)
 
 
     finish_t = timeit.default_timer()
