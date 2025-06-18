@@ -8,6 +8,7 @@ import os
 import pandas as pd
 import geopandas as gpd
 import timeit
+from datetime import datetime
 
 
 def esri_to_gdf(file_path)-> gpd.GeoDataFrame:
@@ -100,7 +101,7 @@ if __name__ == "__main__":
     start_t = timeit.default_timer()
 
     wks = r"Q:\projects\Mwlrs\Land Use Planning\Master_Data"
-    rules_xls = os.path.join(wks, '2025-04-11-Interim IPCA AST Layer - FNnames.xlsx')
+    rules_xls = os.path.join(wks, '2025-06-Interim IPCA AST Layer - FNnames.xlsx')
     ipca_gdb = os.path.join(wks, 'IPCA.gdb')
     intr_gdb = os.path.join(wks, 'interim_IPCA_AST.gdb')
 
@@ -126,10 +127,12 @@ if __name__ == "__main__":
     print("\nProducing the IPCA Interim dataset...")
     gdf_intr = produce_interim (gdf_bndr, gdf_cnslt, gdf_f107)
 
+    print("\nSaving the Interim IPCA dataset...")
+    today = datetime.now().strftime("%Y%m%d")
     gdf_intr.to_file(
         filename=intr_gdb,    
         driver="OpenFileGDB",                 
-        layer="AST_interim_IPCA"    
+        layer=f"AST_interim_IPCA_{today}"    
     )
 
 
