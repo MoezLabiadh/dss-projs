@@ -1,6 +1,27 @@
 """
-This script produces an Interim IPCA dataset for the AST tool 
+Purpose: 
+    This script produces an Interim IPCA dataset for the AST tool.
+    Rules on how each IPCA feature is included in the Iterim dataset are read from an Excel file. 
+    Make sure  to update this file before running the script.
+
+    The script date stamps and archives the existing interim dataset before processing the new one.
+    
+    The script exports the interim dataset to gdb/featureclass, Shapefile, and KML formats 
+    in both the main and shared directories.
+
+Dependencies:
+    - geopandas
+    - pandas
+    (This script must be run in the Python environment with geopandas installed:
+     P:\corp\central_clones\python_geopandas)
+
+Last updated on: 
+    2025-07-24
+
+Author: 
+    Moez Labiadh - GeoBC
 """
+
 import warnings
 warnings.simplefilter(action='ignore')
 
@@ -11,132 +32,150 @@ import timeit
 from datetime import datetime
 
 
-def esri_to_gdf(file_path)-> gpd.GeoDataFrame:
-    """Returns a Geopandas file (gdf) based on 
-       an ESRI format vector (shp or featureclass/gdb)"""
-    if '.shp' in file_path.lower():
-        gdf = gpd.read_file(file_path)
-    elif '.gdb' in file_path:
-        l = file_path.split('.gdb')
-        gdb = l[0] + '.gdb'
-        fc = os.path.basename(file_path)
-        gdf = gpd.read_file(filename=gdb, layer=fc)
+def archive_existing_dataset(ast_gdb_main: str, ast_gdb_arch: str) -> None:
+    """
+    Archives the existing interim IPCA feature class
+    """
+    main_fc= 'AST_interim_IPCA'
+    try:
+        gdf_tmp = esri_to_gdf(os.path.join(ast_gdb_main, main_fc))
+    except:
+        print(f'..No existing feature class found. Nothing to archive.')
+
+    today = datetime.now().strftime("%Y%m%d")
+    gdf_tmp.to_file(
+        filename=ast_gdb_arch,    
+        driver="OpenFileGDB",                 
+        layer=f"AST_interim_IPCA_{today}"
+    )
+    
+
+def esri_to_gdf(path: str) -> gpd.GeoDataFrame:
+    """Returns a GeoDataFrame for a .shp or .gdb feature class."""
+    if path.lower().endswith('.shp'):
+        return gpd.read_file(path)
+    elif '.gdb' in path:
+        gdb = path.split('.gdb')[0] + '.gdb'
+        layer = os.path.basename(path)
+        return gpd.read_file(filename=gdb, layer=layer)
     else:
-        raise Exception('..format not recognized. Please provide a shp or featureclass (gdb)!')
-    
-    return gdf
+        raise Exception('Provide a .shp or .gdb feature class')
 
 
-def show_boundaries(df_ruls, gdf_ipca) -> gpd.GeoDataFrame:
-    """
-    Returns a gdf of IPCA features whose geometries will be included in the interim dataset
-    """
-    df_bndr = df_ruls[
-        df_ruls['Interim approach'] == 'Show boundary'
-    ]
-    list_bndr = df_bndr['FEATURE_ID'].tolist()
-    gdf_bndr = gdf_ipca[gdf_ipca['FEATURE_ID'].isin(list_bndr)]
-
-    gdf_bndr = gdf_bndr[
-        ['FEATURE_ID', 'FIRST_NATION_GROUP','PROJECT_ID','PROJECT_NAME','geometry']
-    ]
-
-    print (f'..Show boudaries has {len(gdf_bndr)} features')
-
-    return gdf_bndr
+def show_boundaries(df_rules: pd.DataFrame, gdf_ipca: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Selects IPCA features marked 'Show boundary'."""
+    ids = df_rules.loc[df_rules['Interim approach'] == 'Show boundary', 'FEATURE_ID']
+    gdf = gdf_ipca[gdf_ipca['FEATURE_ID'].isin(ids)]
+    cols = ['FEATURE_ID', 'FIRST_NATION_GROUP', 'PROJECT_ID', 'PROJECT_NAME', 'geometry']
+    print(f'..Show boundaries: {len(gdf)} features')
+    return gdf[cols]
 
 
-def cnslt_boundaries(df_ruls, gdf_pip) -> gpd.GeoDataFrame:
-    """
-    Returns a gdf of IPCA features whose geometries will be replaced with Consultation Boundaries
-    """
-    df_cnslt = df_ruls[
-        df_ruls['Interim approach'] == 'Consultation boundary'
-    ]
-    
-    gdf_pip = gdf_pip.drop_duplicates(
-        subset='CNSLTN_AREA_NAME',
-        keep='first'
-    )
-
-    gdf_cnslt = pd.merge(
-        df_cnslt[['FEATURE_ID', 'FIRST_NATION_GROUP','CNSLTN_AREA_NAME']],
+def cnslt_boundaries(df_rules: pd.DataFrame, gdf_pip: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Substitutes geometries with Consultation Boundaries."""
+    df_sel = df_rules[df_rules['Interim approach'] == 'Consultation boundary']
+    gdf_pip = gdf_pip.drop_duplicates(subset='CNSLTN_AREA_NAME')
+    merged = pd.merge(
+        df_sel[['FEATURE_ID', 'FIRST_NATION_GROUP', 'CNSLTN_AREA_NAME']],
         gdf_pip[['CNSLTN_AREA_NAME', 'geometry']],
-        how='left',
-        on='CNSLTN_AREA_NAME'
+        on='CNSLTN_AREA_NAME', how='left'
     )
+    gdf_merged = gpd.GeoDataFrame(merged, geometry='geometry', crs=gdf_pip.crs)
+    print(f'..Consultation boundaries: {len(gdf_merged)} features')
+    return gdf_merged
 
-    print (f'..Cnslt boudaries has {len(gdf_cnslt)} features')
 
-    return gdf_cnslt
-
-
-def produce_interim (gdf_bndr, gdf_cnslt, gdf_f107) -> gpd.GeoDataFrame:
-    """
-    Returns a gdf of of interim IPCA dataset
-    """
+def produce_interim(
+    gdf_bndr: gpd.GeoDataFrame,
+    gdf_cnslt: gpd.GeoDataFrame,
+    gdf_f107: gpd.GeoDataFrame
+) -> gpd.GeoDataFrame:
+    """Concatenates all parts into the interim GeoDataFrame."""
     gdf_intr = gpd.GeoDataFrame(
         pd.concat([gdf_bndr, gdf_cnslt, gdf_f107], ignore_index=True),
         crs=gdf_bndr.crs
     )
-
-    gdf_intr.drop(
-        columns=['CNSLTN_AREA_NAME'], 
-        inplace=True
-    )
-
-    gdf_intr.sort_values(
-        by='FEATURE_ID',     
-        ascending=True, 
-        inplace=True,       
-        ignore_index=True     
-    )   
-
-    print (f'..IPCA interim dataset has {len(gdf_intr)} features')
-
+    gdf_intr.drop(columns=['CNSLTN_AREA_NAME'], inplace=True, errors='ignore')
+    gdf_intr.sort_values('FEATURE_ID', inplace=True, ignore_index=True)
+    print(f'..Interim dataset: {len(gdf_intr)} features')
     return gdf_intr
 
 
-if __name__ == "__main__":
-    start_t = timeit.default_timer()
+def export_interim_ipca(interim_dir: str, gdb: str, gdf_intr: gpd.GeoDataFrame) -> None:
+    """
+    Exports the interim IPCA GeoDataFrame to to OpenFileGDB, 
+    Shapefile, and KML
+    """
+    # Paths
+    shapefile = os.path.join(interim_dir, 'AST_interim_IPCA.shp')
+    kml_file = os.path.join(interim_dir, 'AST_interim_IPCA.kml')
 
-    wks = r"Q:\projects\Mwlrs\Land Use Planning\Master_Data"
-    rules_xls = os.path.join(wks, '2025-06-Interim IPCA AST Layer - FNnames.xlsx')
-    ipca_gdb = os.path.join(wks, 'IPCA.gdb')
-    intr_gdb = os.path.join(wks, 'interim_IPCA_AST.gdb')
+    # Overwrite main feature class
+    gdf_intr.to_file(
+        filename=gdb,    
+        driver="OpenFileGDB",                 
+        layer=f"AST_interim_IPCA"  # Overwrite the main dataset
+    )
+    print(f'..Overwrote main feature class')
 
-    print ("Reading IPCA interim rules...")
-    df_ruls = pd.read_excel(rules_xls)
+    # Shapefile export
+    gdf_intr.to_file(shapefile)
+    print(f'..Exported shapefile')
 
-    print ("\nReading IPCA dataset...")
+    # KML export
+    gdf_intr.to_file(kml_file, driver='KML')
+    print(f'..Exported KML')
+
+
+
+if __name__ == '__main__':
+    start = timeit.default_timer()
+
+    # Base directories
+    BASE_DIR = r"W:\ilmb\dss\projects\Mwlrs\Land Use Planning\Master_Data"
+    INTERIM_DIR = os.path.join(BASE_DIR, 'interim_IPCA')
+    INTERIM_DIR_SHARE = r'W:\!Shared_Access\IPCA'
+
+    # File paths
+    rules_xls = os.path.join(BASE_DIR, '2025-06-Interim IPCA AST Layer - FNnames.xlsx')
+    ipca_gdb = os.path.join(BASE_DIR, 'IPCA.gdb')
+    ast_gdb_main = os.path.join(INTERIM_DIR, 'interim_IPCA_AST_main.gdb')
+    ast_gdb_arch = os.path.join(INTERIM_DIR, 'interim_IPCA_AST_archive.gdb')
+    pip_table = os.path.join(ast_gdb_main, 'IPCA_CNSLT_AREAS')
+    f107_fc = os.path.join(ast_gdb_main, 'F107')
+
+    print('Archiving existing IPCA interim dataset...')
+    archive_existing_dataset(ast_gdb_main, ast_gdb_arch)
+
+    print('\nReading IPCA interim rules...')
+    df_rules = pd.read_excel(rules_xls)
+
+    print('\nReading IPCA dataset...')
     gdf_ipca = esri_to_gdf(os.path.join(ipca_gdb, 'IPCA'))
 
-    print ("\nReading PIP dataset...")
-    gdf_pip= esri_to_gdf(os.path.join(intr_gdb, 'IPCA_CNSLT_AREAS'))
+    print('\nReading PIP consultation boundaries...')
+    gdf_pip = esri_to_gdf(pip_table)
 
-    print("\nCreating a 'Show Boundaries' dataset...")
-    gdf_bndr = show_boundaries(df_ruls, gdf_ipca)
+    print("\nSelecting 'Show Boundaries'...")
+    gdf_bndr = show_boundaries(df_rules, gdf_ipca)
 
-    print("\nCreating a 'Consultation Boundaries' dataset...")
-    gdf_cnslt = cnslt_boundaries(df_ruls, gdf_pip) 
+    print("\nSelecting 'Consultation Boundaries'...")
+    gdf_cnslt = cnslt_boundaries(df_rules, gdf_pip)
 
-    print("\nReading special features...")
-    gdf_f107 = esri_to_gdf(os.path.join(intr_gdb, 'F107'))
-    gdf_f107 = gdf_f107[['FEATURE_ID', 'FIRST_NATION_GROUP','geometry']]
+    print("\nReading special features (F107)...")
+    gdf_f107 = esri_to_gdf(f107_fc)[['FEATURE_ID', 'FIRST_NATION_GROUP', 'geometry']]
 
-    print("\nProducing the IPCA Interim dataset...")
-    gdf_intr = produce_interim (gdf_bndr, gdf_cnslt, gdf_f107)
+    print("\nBuilding interim dataset...")
+    gdf_intr = produce_interim(gdf_bndr, gdf_cnslt, gdf_f107)
 
-    print("\nSaving the Interim IPCA dataset...")
-    today = datetime.now().strftime("%Y%m%d")
-    gdf_intr.to_file(
-        filename=intr_gdb,    
-        driver="OpenFileGDB",                 
-        layer=f"AST_interim_IPCA_{today}"    
-    )
+    # Export outputs
+    print("\nExporting files to main folder...")
+    export_interim_ipca(INTERIM_DIR, ast_gdb_main, gdf_intr)
 
+    print("\nExporting files to Share folder...")
+    share_gdb = os.path.join(INTERIM_DIR_SHARE, 'IPCA_AST.gdb')
+    export_interim_ipca(INTERIM_DIR_SHARE, share_gdb, gdf_intr)
 
-    finish_t = timeit.default_timer()
-    t_sec = round(finish_t - start_t)
-    mins, secs = divmod(t_sec, 60)
-    print(f'\nProcessing Completed in {mins} minutes and {secs} seconds')
+    elapsed = round(timeit.default_timer() - start)
+    m, s = divmod(elapsed, 60)
+    print(f'\nProcessing completed in {m}m {s}s')
