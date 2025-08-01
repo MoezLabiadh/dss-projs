@@ -11,7 +11,7 @@ import numpy as np
 from skimage import morphology
 import os
 
-def remove_roads_morphological(input_path, output_path, kernel_size=2, urban_value=1):
+def remove_roads_single_kernel(input_path, output_path, kernel_size=1, urban_value=1):
     """
     Remove road pixels from urban classification using morphological opening.
     
@@ -51,12 +51,7 @@ def remove_roads_morphological(input_path, output_path, kernel_size=2, urban_val
     
     # Apply morphological opening
     # This removes small objects and narrow connections (like roads)
-    cleaned_mask = morphology.opening(urban_mask, selem)
-    
-    # Convert back to original data type and values
-    result = data.copy()
-    result[urban_mask == 1] = 0  # Remove all original urban pixels
-    result[cleaned_mask == 1] = urban_value  # Add back cleaned urban pixels
+    result = morphology.opening(urban_mask, selem)
     
     print(f"Urban pixels after filtering: {np.sum(result == urban_value)}")
     print(f"Removed pixels: {np.sum(data == urban_value) - np.sum(result == urban_value)}")
@@ -69,6 +64,7 @@ def remove_roads_morphological(input_path, output_path, kernel_size=2, urban_val
     print("Processing complete!")
     
     return result
+
 
 def remove_roads_multi_kernel(input_path, output_path, kernel_sizes=[1, 2, 3], urban_value=1):
     """
@@ -85,7 +81,7 @@ def remove_roads_multi_kernel(input_path, output_path, kernel_sizes=[1, 2, 3], u
     
     # Create binary mask for urban areas
     urban_mask = (data == urban_value).astype(np.uint8)
-    result_mask = urban_mask.copy()
+    result = urban_mask.copy()
     
     # Apply opening with multiple kernel sizes
     for kernel_size in kernel_sizes:
@@ -93,13 +89,8 @@ def remove_roads_multi_kernel(input_path, output_path, kernel_sizes=[1, 2, 3], u
         selem = morphology.disk(kernel_size)
         
         # Apply opening and intersect with previous result
-        opened = morphology.opening(result_mask, selem)
-        result_mask = result_mask & opened
-    
-    # Convert back to original data type and values
-    result = data.copy()
-    result[urban_mask == 1] = 0  # Remove all original urban pixels
-    result[result_mask == 1] = urban_value  # Add back cleaned urban pixels
+        opened = morphology.opening(result, selem)
+        result = result & opened
     
     print(f"Urban pixels after filtering: {np.sum(result == urban_value)}")
     print(f"Removed pixels: {np.sum(data == urban_value) - np.sum(result == urban_value)}")
@@ -118,12 +109,12 @@ if __name__ == "__main__":
     # Input and output file paths
     workspace = r'\\spatialfiles.bcgov\work\ilmb\dss\dss_workarea\mlabiadh\workspace\20250611_HD_2025\urban'
     input_file = os.path.join(workspace, "urban.tif")
-    output_file = os.path.join(workspace, "urban_morph_single_kernel.tif") 
+    output_file = os.path.join(workspace, "urban_morph_single_kernel_rerun.tif") 
     
     # Parameters
-    kernel_size = 2      # Adjust kernel size as needed (1-4 typical range)
+    kernel_size = 1      # Adjust kernel size as needed (1-4 typical range)
     urban_value = 17      # Pixel value representing urban areas
-    use_multi_kernel = True  # Set to False for single kernel approach
+    use_multi_kernel = False  # Set to False for single kernel approach
     
     # Check if input file exists
     if not os.path.exists(input_file):
@@ -139,11 +130,11 @@ if __name__ == "__main__":
     try:
         if use_multi_kernel:
             # Use multiple kernel sizes for better results
-            kernel_sizes = [1] #increase kernel for more agressive filtering, e.g., [1, 2, 3, 4]
+            kernel_sizes = [1,2] #increase kernel for more agressive filtering, e.g., [1, 2, 3, 4]
             remove_roads_multi_kernel(input_file, output_file, kernel_sizes, urban_value)
         else:
             # Use single kernel size
-            remove_roads_morphological(input_file, output_file, kernel_size, urban_value)
+            remove_roads_single_kernel(input_file, output_file, kernel_size, urban_value)
             
     except Exception as e:
         print(f"Error processing file: {str(e)}")
